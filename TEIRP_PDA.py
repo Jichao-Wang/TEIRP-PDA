@@ -1975,20 +1975,20 @@ def two_aggregator():
                          1200)
     iso = ISO(total_power, len(aggs))
 
-    # # draw power assignment results calculated by Gurobi
-    # draw_assignment(aggs, total_power, iso, cost_param, sample_time=600)
-    #
-    # # draw power assignment results calculated by TEIRP-PDA
-    # draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_times=600)
-    # # draw turning points of stage 1 in TEIRP-PDA
-    # positions = get_inflection_positions(iso, aggs, cost_param)
-    # draw_critical_points(iso, aggs, positions)
-    #
-    # # Compare the calculation speed for coordinate mass aggregators by Gurobi or TEIRP-PDA
-    # my_sample_times = 150
-    # draw_time(cost_param, my_sample_times)
+    # draw power assignment results calculated by Gurobi
+    draw_assignment(aggs, total_power, iso, cost_param, sample_time=600)
 
-    # 仿真二次调频的实验
+    # draw power assignment results calculated by TEIRP-PDA
+    draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_times=600)
+    # draw turning points of stage 1 in TEIRP-PDA
+    positions = get_inflection_positions(iso, aggs, cost_param)
+    draw_critical_points(iso, aggs, positions)
+
+    # Compare the calculation speed for coordinate mass aggregators by Gurobi or TEIRP-PDA
+    my_sample_times = 150
+    draw_time(cost_param, my_sample_times)
+
+    # Simulate the frequency
     frequency_regulation_simulator1()
 
 
