@@ -28,4 +28,4 @@ Some python packages:
 
 **Note**: If you want simulate the frequency, please launch Matlab before run python files.
 
-`python two_aggregator.py`
+`python TEIRP_PDA.py`
