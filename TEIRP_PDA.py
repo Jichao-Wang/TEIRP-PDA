@@ -4,10 +4,17 @@ from scipy.optimize import minimize
 from scipy.special import gamma
 from scipy.stats import beta
 
+# import pyomo.environ as pyo
 from gurobipy import *
+import mosek
+# import docplex.mp.model as cpx
+# from pyomo.contrib.cvxopt import interface
+from qpsolvers import solve_qp
+
 import matlab  # matlab用于数据转换等工作
 import matlab.engine  # engine启动调用的matlab函数
 
+from pypower.api import case33
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from matplotlib.legend_handler import HandlerTuple
@@ -72,8 +79,181 @@ class ISO:
         self.p_set = p
 
 
-def assignment_gurobi(iso, aggs, cost_param):
+def define_mpc(mpc, aggs, nid2aid={3: [0], 21: [1], 17: [2], 28: [3]}):
+    # print(mpc["branch"][0][0])
+    # print(mpc["branch"][0][1])
+    # print(mpc["branch"][0][2])
+    # print(mpc["branch"][0][3])
+    # print(type(mpc["branch"]))
+    kappa = 0.05  # 负荷节点功率因数
+
+    big_feeders = [
+        [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], [3, 17],
+        [25, 26, 27, 29, 30, 31, 32], [28],
+        [18, 19, 20], [21],
+        [22, 23, 24], []
+    ]
+
+    # 构建一个矩阵，第i行记录表示节点i以及功率流流过节点i的所有节点的id（节点编号从0开始）
+    mpc["adj"] = [
+        [[0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 29, 30, 31, 32],
+         [3, 21, 17, 28], -1],
+        [[1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 22, 23, 24, 25, 26, 27, 29, 30, 31, 32],
+         [3, 21, 17, 28], 0],
+        [[2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 22, 23, 24, 25, 26, 27, 29, 30, 31, 32], [3, 17, 28], 1],
+        [[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 25, 26, 27, 29, 30, 31, 32], [3, 17, 28], 2],
+        [[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 25, 26, 27, 29, 30, 31, 32], [17, 28], 3],
+        [[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 25, 26, 27, 29, 30, 31, 32], [17, 28], 4],
+        [[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], [17], 5],
+        [[7, 8, 9, 10, 11, 12, 13, 14, 15, 16], [17], 6],
+        [[8, 9, 10, 11, 12, 13, 14, 15, 16], [17], 7],
+        [[9, 10, 11, 12, 13, 14, 15, 16], [17], 8],
+        [[10, 11, 12, 13, 14, 15, 16], [17], 9],
+        [[11, 12, 13, 14, 15, 16], [17], 10],
+        [[12, 13, 14, 15, 16], [17], 11],
+        [[13, 14, 15, 16], [17], 12],
+        [[14, 15, 16], [17], 13],
+        [[15, 16], [17], 14],
+        [[16], [17], 15],
+        [[], [17], 16],
+        [[18, 19, 20], [21], 17],
+        [[19, 20], [21], 18],
+        [[20], [21], 19],
+        [[], [21], 20],
+        [[22, 23, 24], [], 21],
+        [[23, 24], [], 22],
+        [[24], [], 23],
+        [[25, 26, 27, 29, 30, 31, 32], [28], 24],
+        [[26, 27, 29, 30, 31, 32], [28], 25],
+        [[27, 29, 30, 31, 32], [28], 26],
+        [[29, 30, 31, 32], [28], 27],
+        [[29, 30, 31, 32], [], 28],
+        [[30, 31, 32], [], 29],
+        [[31, 32], [], 30],
+        [[32], [], 31]
+    ]
+
+    # information of feeders (only 4 feeders in IEEE-33 case)
+    mpc["pre_nodes"] = [[1, 2, 22, 23, 24],  # 上路
+                        [1, 2, 3, 4, 5, 25, 26, 27, 28, 29, 30, 31, 32],  # 中上路
+                        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],  # 中路
+                        [1, 18, 19, 20, 21]  # 下路
+                        ]
+    mpc["pre_lines"] = [[0, 1, 21, 22, 23],  # 上路
+                        [0, 1, 2, 3, 4, 24, 25, 26, 27, 28, 29, 30, 31],  # 中上路
+                        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],  # 中路
+                        [0, 17, 18, 19, 20]  # 下路
+                        ]
+
+    mpc["nid2aid"] = nid2aid  # 节点id:[agg id]
+
+    # 流过每个节点（以及本身）的功率压降。每条记录包含2个参数，[常数P对应的压降(P*(R+kappa*X))，各个聚合商对应的压降参数(未乘c*\eta)]
+    mpc["diff_v_param"] = [[0] * (1 + len(aggs))]
+    for i in range(1, len(mpc["adj"])):
+        branch_id = mpc["adj"][i][2]
+        line_rx = mpc["branch"][branch_id][2] + kappa * mpc["branch"][branch_id][3]
+        tmp = [0] * (1 + len(aggs))
+        tmp1 = 0
+        for k in range(len(mpc["adj"][i][0])):
+            tmp1 += mpc["bus"][mpc["adj"][i][0][k]][2]
+
+        for k in range(len(mpc["adj"][i][1])):
+            node_aggs = mpc["nid2aid"].get(mpc["adj"][i][1][k], [])
+            if len(node_aggs) != 0:
+                for j in node_aggs:
+                    tmp[j + 1] = line_rx
+        tmp[0] = tmp1 * line_rx
+        mpc["diff_v_param"].append(copy.deepcopy(tmp))
+
+    # print("diff_v_param")
+    # for i in range(len(mpc["diff_v_param"])):
+    #     print(i, mpc["diff_v_param"][i])
+    # print(len(mpc["diff_v_param"]), len(mpc["diff_v_param"][0]))  # 33*5
+
+    # 每条支路终点处的电压压降
+    mpc["diff_V_terminate_nodes"] = []
+    for i in range(len(mpc["pre_lines"])):  # 对于每个feeder终点
+        tmp = [0] * (1 + len(aggs))  # 存储格式为[常数, c_i*\eta_i前对应的系数, ... , c_i*\eta_i前对应的系数]
+        for j in range(len(mpc["pre_nodes"][i])):
+            for k in range(1 + len(aggs)):
+                tmp[k] += mpc["diff_v_param"][mpc["pre_nodes"][i][j]][k]
+
+        mpc["diff_V_terminate_nodes"].append(copy.deepcopy(tmp))
+
+    # print("diff_V")
+    # for i in range(len(mpc["diff_V_terminate_nodes"])):
+    #     print(i, mpc["diff_V_terminate_nodes"][i])
+
+
+def assignment_gurobi(iso, aggs, cost_param, mpc, method="gurobi"):
+    if method == "gurobi":
+        return assignment_gurobi_only(iso, aggs, cost_param, mpc, method="gurobi")
+    elif method == "cplex":
+        return assignment_cplex_only(iso, aggs, cost_param, mpc, method="cplex")
+    # elif method == "mosek":
+    #     solver = pyo.SolverFactory('mosek')  # 结果和其他的不一样
+    # elif method == "ipopt":
+    #     solver = pyo.SolverFactory('ipopt')
+
+
+def assignment_cplex_only(iso, aggs, cost_param, mpc, method="cplex"):
+    global V_root_sqr, V_max_sqr, V_min_sqr
+    t0 = time.time()
+
+    # Create a model
+    m = cpx.Model()
+    # Create variables
+    etas = m.continuous_var_list([i for i in range(len(aggs))], name='X')
+
+    # Set objective
+    m.minimize(cost_param[0] +
+               cost_param[1] * (iso.p_set - sum([aggs[i].capacity * E(aggs[i]) * etas[i] for i in range(len(aggs))])) +
+               cost_param[2] * (
+                       pow(iso.p_set - sum([aggs[i].capacity * E(aggs[i]) * etas[i] for i in range(len(aggs))]),
+                           2) +
+                       sum(aggs[i].capacity * aggs[i].capacity * etas[i] * etas[i] * Var(aggs[i]) for i in
+                           range(len(aggs)))
+               ) + sum(
+        aggs[i].price_param * aggs[i].capacity * etas[i] * E(aggs[i]) for i in range(len(aggs))))
+
+    # Add constraints:
+    m.add_constraint(iso.p_set >= sum(etas[i] * aggs[i].capacity for i in range(len(aggs))), "c_e")
+    for i in range(len(etas)):
+        m.add_constraint(etas[i] >= 0, "c_m" + str(i + 1))
+        m.add_constraint(etas[i] <= 1, "c_l" + str(i + 1))
+    for i in range(4):
+        m.add_constraint(
+            (V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) >= (1e3) * (mpc["diff_V_terminate_nodes"][i][0] + sum(
+                mpc["diff_V_terminate_nodes"][i][j + 1] * etas[j] * aggs[j].capacity * E(aggs[j]) for j in
+                range(len(aggs)))), "c_v" + str(i + 1))
+
+    # solve
+    t1 = time.time()
+    solution = m.solve()
+    t2 = time.time()
+
+    if solution:
+        eta, cost = [], solution.objective_value
+        for v in [solution.get_value(v) for v in etas]:
+            if abs(v) < 1e-6:
+                eta.append(0)
+            else:
+                eta.append(v)
+        # print("eta:", eta)
+        # print('cost:', m.objVal)
+        t3 = time.time()
+        return cost, eta, t3 - t0
+    else:
+        print("Not optimal solution from Cplex.")
+        t3 = time.time()
+        return -1, [], t3 - t0
+
+
+def assignment_gurobi_only(iso, aggs, cost_param, mpc, method="gurobi"):
     # 求ISO对每个AGG的最优功率分配策略
+    global V_root_sqr, V_max_sqr, V_min_sqr
+
+    t0 = time.time()
 
     # Create a model
     m = Model("mip1")
@@ -98,7 +278,7 @@ def assignment_gurobi(iso, aggs, cost_param):
                    sum(aggs[i].price_param * aggs[i].capacity * etas[i] * E(aggs[i]) for i in range(len(aggs)))
                    , GRB.MINIMIZE)
 
-    # Add equality constraint
+    # Add inequality constraint
     m.addConstr(iso.p_set >= sum(etas[i] * aggs[i].capacity for i in range(len(aggs))), "c_e")
 
     # Add inequality constraints:
@@ -106,7 +286,16 @@ def assignment_gurobi(iso, aggs, cost_param):
         m.addConstr(etas[i] >= 0, "c_m" + str(i + 1))
         m.addConstr(etas[i] <= 1, "c_l" + str(i + 1))
 
+    # voltage constraints
+    for i in range(len(mpc["pre_lines"])):
+        m.addConstr((V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) >= (1e3) * (mpc["diff_V_terminate_nodes"][i][0] + sum(
+            mpc["diff_V_terminate_nodes"][i][j + 1] * etas[j] * aggs[j].capacity * E(aggs[j]) for j in
+            range(len(aggs)))), name="c_v" + str(i + 1))
+
+    # solve
+    t1 = time.time()
     m.optimize()
+    t2 = time.time()
 
     if m.status == 2:
         eta, cost = [], m.objVal
@@ -117,67 +306,15 @@ def assignment_gurobi(iso, aggs, cost_param):
                 eta.append(v.x)
         # print("eta:", eta)
         # print('cost:', m.objVal)
-        return cost, eta
+        t3 = time.time()
+        return cost, eta, t3 - t0
     else:
         print("Not optimal solution from Gurobi.")
-        return -1, []
+        t3 = time.time()
+        return -1, [], t3 - t0
 
 
-def assignment_ito_gurobi(iso, aggs, cost_param):
-    # 在方差随调用量线性变化的情况下，求ISO对每个AGG的最优功率分配策略.
-
-    # Create a model
-    m = Model("mip1")
-    m.setParam('OutputFlag', 0)
-
-    # Create variables
-    etas = []
-    for i in range(len(aggs)):
-        etas.append(m.addVar(vtype=GRB.CONTINUOUS, name="eta" + str(i + 1)))
-
-    # Set objective, like E(X^2) = D(X) + E(X)^2, where X = p_set - \eta_{ri}
-    m.setObjective(cost_param[0] +
-                   cost_param[1] * (iso.p_set - sum(
-        [aggs[i].capacity * aggs[i].alpha / (aggs[i].alpha + aggs[i].beta) * etas[i] for i in
-         range(len(aggs))])) +
-                   cost_param[2] * (pow(iso.p_set - sum(
-        [aggs[i].capacity * aggs[i].alpha / (aggs[i].alpha + aggs[i].beta) * etas[i] for i in range(len(aggs))]),
-                                        2) +
-                                    sum(aggs[i].capacity * aggs[i].capacity * etas[i] * etas[i] * Var(aggs[i]) for i in
-                                        range(len(aggs)))
-                                    ) +
-
-                   sum(aggs[i].price_param * aggs[i].capacity * etas[i] * aggs[i].alpha / (
-                           aggs[i].alpha + aggs[i].beta) for i in range(len(aggs)))
-
-                   , GRB.MINIMIZE)
-
-    # Add equality constraint
-    m.addConstr(iso.p_set >= sum(etas[i] * aggs[i].capacity for i in range(len(aggs))), "c_e")
-
-    # Add inequality constraints:
-    for i in range(len(etas)):
-        m.addConstr(etas[i] >= 0, "c_m" + str(i + 1))
-        m.addConstr(etas[i] <= 1, "c_l" + str(i + 1))
-
-    m.optimize()
-
-    if m.status == 2:
-        eta, cost = [], m.objVal
-        for v in m.getVars():
-            if abs(v.x) < 1e-6:
-                eta.append(0)
-            else:
-                eta.append(v.x)
-        # print("eta:", eta)
-        # print('cost:', m.objVal)
-        return cost, eta
-    else:
-        print("Not optimal solution from Gurobi.")
-        return -1, []
-
-
-def draw_assignment(aggs, total_power, iso, cost_param, sample_time=200):
+def draw_assignment(aggs, total_power, iso, cost_param, mpc, sample_time=200):
     p_set, etas, costs = [], [], []
     for i in range(len(aggs)):
         etas.append([])
@@ -187,7 +324,7 @@ def draw_assignment(aggs, total_power, iso, cost_param, sample_time=200):
 
     for i in range(sample_time + 1):
         iso.set_total_power(i / sample_time * total_power)
-        cost, eta = assignment_gurobi(iso, aggs, cost_param)
+        cost, eta, _ = assignment_gurobi(iso, aggs, cost_param, mpc)
         p_set.append(i / sample_time * total_power)
         for j in range(len(aggs)):
             etas[j].append(eta[j])
@@ -218,15 +355,18 @@ def draw_assignment(aggs, total_power, iso, cost_param, sample_time=200):
     line, = ax2.plot(p_set, costs, color='#17becf', linestyle='--', label="cost")
     lines.append(line)
     ax2.set_ylabel(r"Expectation of DSO cost (\$)   ")
-    delta_y = 150
+    delta_y = 250
     ax2.set_ylim([0, 5 * delta_y])
     yticks_pos2 = [0, 1 * delta_y, 2 * delta_y, 3 * delta_y, 4 * delta_y, 5 * delta_y]
     yticks_labels2 = [f'{int(tick)}' for tick in yticks_pos2]
     ax2.set_yticks(yticks_pos2)
     ax2.set_yticklabels(yticks_labels2)
 
-    ax1.legend(handles=lines, loc='upper left', bbox_to_anchor=(1.1, 1), borderaxespad=0.)
+    # ax1.legend(handles=lines, loc='upper left', bbox_to_anchor=(1.1, 1), borderaxespad=0.)
+    ax1.legend(handles=lines, loc='upper left')
     ax1.grid(color='gray', linestyle='--', linewidth=0.5)
+
+    plt.subplots_adjust(right=0.8)
 
     plt.savefig("./assignment.svg", format="svg")
     plt.show()
@@ -268,7 +408,16 @@ def E_cost_function(aggs, iso, cost_param, eta):
     return cost
 
 
-def draw_MonteCarlo_assignment(aggs, total_power, iso, cost_param):
+def assignment_PAM(iso, aggs, cost_param, mpc):
+    cost, etas = 0, [0] * len(aggs)
+    total = sum(aggs[i].capacity for i in range(len(aggs)))
+    for i in range(len(etas)):
+        etas[i] = min(iso.p_set, total) / total
+    cost = E_cost_function(aggs, iso, cost_param, etas)
+    return cost, etas
+
+
+def draw_MonteCarlo_assignment(aggs, total_power, iso, cost_param, mpc):
     p_set, etas, costs = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000], [], []
     theory_costs = []
     for i in range(len(p_set)):
@@ -276,7 +425,7 @@ def draw_MonteCarlo_assignment(aggs, total_power, iso, cost_param):
 
     for i in range(len(p_set)):
         iso.set_total_power(p_set[i])
-        theory_cost, eta = assignment_gurobi(iso, aggs, cost_param)
+        theory_cost, eta, _ = assignment_gurobi(iso, aggs, cost_param, mpc)
         theory_costs.append(theory_cost)
         for j in range(10000):
             costs[i].append(simulate_cost_function(aggs, iso, cost_param, eta))
@@ -295,12 +444,12 @@ def draw_MonteCarlo_assignment(aggs, total_power, iso, cost_param):
 
     ax.scatter(p_set, mean_cost, color=h1_color, marker="|", zorder=2)
     h2 = ax.scatter(p_set, theory_costs, color="#17becf", marker="_",
-                    label="Expectation of cost calculated by TEIRP-PDA",
+                    label="TEIRP-PDA",
                     zorder=3)
     # h2_patch = mpatches.Patch(color="r", label="Monte Carlo")
     h3 = ax.scatter(None, None, color="tomato", marker="_", label="Average cost of simulations")
 
-    plt.ylim(0, 700)
+    plt.ylim(0, 1400)
     plt.xlabel(r"$P_{AGC}$ (MW)")
     plt.ylabel(r"Expectation of Cost (\$)")
 
@@ -315,46 +464,6 @@ def draw_MonteCarlo_assignment(aggs, total_power, iso, cost_param):
     plt.savefig("./Monte_Carlo_assignment.svg", format="svg")
     plt.show()
     return 0
-
-
-def draw_assignment_pset(aggs, total_power, iso, cost_param, sample_time=200):
-    ax_x, etas, costs = [], [], []
-    for i in range(len(aggs)):
-        etas.append([])
-
-    origin_alpha0 = aggs[0].alpha
-    for i in range(sample_time):
-        aggs[0].set_beta(i * 0.03 * origin_alpha0)
-        cost, eta = assignment_gurobi(iso, aggs, cost_param)
-        ax_x.append(i * 0.03 * origin_alpha0)
-        for j in range(len(aggs)):
-            etas[j].append(eta[j])
-        costs.append(cost)
-
-    # 设置图形大小和线条颜色
-    fig = plt.figure()
-    ax1 = fig.add_subplot(111)
-    lines = []
-    for i in range(len(aggs)):
-        line, = ax1.plot(ax_x, etas[i], label="agg" + str(i + 1))
-        lines.append(line)
-    ax1.set_title("Demand response assignment of total power as " + str(iso.p_set) + "MW with various $\\beta_0$ .")
-    ax1.set_xlabel("Beta of the aggregator 1")
-    ax1.set_ylabel("The proportion of each aggregator capacity called by ISO. (%)")
-    ax1.set_xlim([0, int(ax_x[-1]) + 1])
-    ax1.set_ylim([0, 1.1])
-
-    ax2 = ax1.twinx()
-    line, = ax2.plot(ax_x, costs, color='r', linestyle='--', label="cost")
-    lines.append(line)
-    ax2.set_ylabel(r"ISO cost expectation (\$)")
-    ax2.set_ylim([0, 5500])
-
-    ax1.legend(handles=lines, loc='lower right')
-    ax1.grid(color='gray', linestyle='--', linewidth=0.5)
-
-    plt.savefig("./assignment_pset" + str(iso.p_set) + ".svg", format="svg")
-    plt.show()
 
 
 def value_estimate_function(iso, aggs, cost_param, eta, i):
@@ -377,22 +486,58 @@ def value_estimate_function(iso, aggs, cost_param, eta, i):
     return val
 
 
-def draw_value_estimate_function_local(aggs, total_power, iso, cost_param, sample_time=200):
+def draw_value_estimate_function(aggs, total_power, iso, cost_param, mpc, sample_time=200,
+                                 file_end_name="gurobi"):
     p_set, prices = [], []
+    tmp_iso = copy.deepcopy(iso)
+    eta = None
     for i in range(len(aggs)):
         prices.append([])
 
-    for i in range(sample_time + 1):
-        iso.set_total_power(i / sample_time * total_power)
-        # iso.set_total_power(313*2 + i / sample_time * total_power)
-        assign_cost, eta = assignment_gurobi(iso, aggs, cost_param)
-        p_set.append(i / sample_time * total_power)
-        # p_set.append(313*2 + i / sample_time * total_power)
-        # print(i, iso.p_set, eta, end="; ")
-        for j in range(len(aggs)):
-            prices[j].append(value_estimate_function(iso, aggs, cost_param, eta, j))
-        #     print(value_estimate_function(iso, aggs, cost_param, eta, j), end=' ')
-        # print("")
+    if file_end_name == "TEIRP":
+        positions = get_inflection_positions(tmp_iso, aggs, cost_param, mpc)
+        for i in range(sample_time + 1):
+            tmp_Pset = i / sample_time * total_power
+            p_set.append(tmp_Pset)
+            tmp_iso.set_total_power(tmp_Pset)
+            tmp_Pset, tmp_eta_init, tmp_using_aggs = i / sample_time * total_power, [0 for k in range(len(aggs))], []
+            stage_id = -1
+            for j in range(1, len(positions)):
+                if tmp_Pset <= positions[j][0]:
+                    stage_id = j - 1
+                    break
+            # print(Pset_list[i], "MW stage_id", stage_id, tmp_Pset, positions[stage_id][0])
+            etas = []
+            if stage_id == len(positions) - 1:
+                tmp_iso.p_set = tmp_Pset
+                etas = positions[-1][1]
+            else:
+                tmp_iso.p_set = tmp_Pset
+                tmp_eta_init, tmp_using_aggs = positions[stage_id][1], positions[stage_id][2]
+                _, eta = dispatch_with_inital_state(tmp_iso, aggs, cost_param, mpc, tmp_eta_init, tmp_using_aggs)
+
+            for j in range(len(aggs)):
+                prices[j].append(-1 * value_estimate_function(tmp_iso, aggs, cost_param, eta, j))
+            #     print(value_estimate_function(tmp_iso, aggs, cost_param, eta, j), end=' ')
+
+            # if i == 555:
+            #     print(i, tmp_Pset, eta, prices[2][i])
+            #     print("stage_id", stage_id, len(positions) - 2, positions[stage_id][1], positions[stage_id][2])
+            #     print("Input:", tmp_iso.p_set, tmp_eta_init, tmp_using_aggs)
+    else:
+        for i in range(sample_time + 1):
+            tmp_Pset = i / sample_time * total_power
+            p_set.append(tmp_Pset)
+            tmp_iso.set_total_power(tmp_Pset)
+            # tmp_iso.set_total_power(313*2 + i / sample_time * total_power)
+            _, eta, _ = assignment_gurobi(tmp_iso, aggs, cost_param, mpc, method=file_end_name)
+            # p_set.append(313*2 + i / sample_time * total_power)
+            # print(i, tmp_iso.p_set, eta, end="; ")
+            for j in range(len(aggs)):
+                prices[j].append(-1 * value_estimate_function(tmp_iso, aggs, cost_param, eta, j))
+            #     print(value_estimate_function(tmp_iso, aggs, cost_param, eta, j), end=' ')
+            # print("")
+
     # 设置图形大小和线条颜色
     fig, lines = plt.figure(), []
     ax1 = fig.add_subplot(111)
@@ -403,74 +548,23 @@ def draw_value_estimate_function_local(aggs, total_power, iso, cost_param, sampl
     ax1.set_xlabel(r"$P_{AGC}$ (MW)")
     ax1.set_ylabel(r"Incremental rate")
 
-    # y_bottom, y_top = -8, 3
-    # yticks_pos1 = [i for i in range(y_bottom, y_top, 1)]
-    # yticks_pos1.append(y_top)
-    # yticks_labels1 = [f"{int(tick)}" for tick in yticks_pos1]
-    # ax1.set_yticks(yticks_pos1)
-    # ax1.set_yticklabels(yticks_labels1)
-    # ax1.set_ylim([y_bottom, y_top])
-    #
-    # ax1.set_xlim([0, iso.p_set + 1])
-    # xticks_pos1 = [i * 100 for i in range(int(iso.p_set / 100 + 1))]
-    # xticks_labels1 = [f"{int(tick)}" for tick in xticks_pos1]
-    # plt.xticks(xticks_pos1, xticks_labels1, rotation=0)
-
-    ax1.legend(handles=lines, loc='lower right')
-    ax1.grid(color='gray', linestyle='--', linewidth=0.5)
-
-    plt.savefig("./prices.svg", format="svg")
-    plt.show()
-
-    # name = []
-    # for i in range(len(aggs)):
-    #     name.append("LA" + str(i + 1))
-    # test = pd.DataFrame(data=prices).transpose()
-    # test.columns = name
-    # test.to_csv('./incremental_rate.csv', encoding='gbk')
-
-
-def draw_value_estimate_function(aggs, total_power, iso, cost_param, sample_time=200):
-    p_set, prices = [], []
-    for i in range(len(aggs)):
-        prices.append([])
-
-    for i in range(sample_time + 1):
-        iso.set_total_power(i / sample_time * total_power)
-        assign_cost, eta = assignment_gurobi(iso, aggs, cost_param)
-        p_set.append(i / sample_time * total_power)
-        # print(i, iso.p_set, eta, end="; ")
-        for j in range(len(aggs)):
-            prices[j].append(-1.0 * value_estimate_function(iso, aggs, cost_param, eta, j))
-        #     print(value_estimate_function(iso, aggs, cost_param, eta, j), end=' ')
-        # print("")
-    # 设置图形大小和线条颜色
-    fig, lines = plt.figure(), []
-    ax1 = fig.add_subplot(111)
-    for i in range(len(aggs)):
-        line, = ax1.plot(p_set, prices[i], label="LA" + str(i + 1))
-        lines.append(line)
-    # ax1.set_title("Incremental rate of aggregators.")
-    ax1.set_xlabel(r"$P_{AGC}$ (MW)")
-    ax1.set_ylabel(r"Incremental Rate")
-    ax1.set_xlim([0, total_power])
-    y_bottom, y_top = -40, 7
-    yticks_pos1 = [np.round(i * 0.1, 2) for i in range(y_bottom, y_top, 5)]
-    yticks_pos1.append(y_top * 0.1)
-    yticks_labels1 = [f"{np.round(tick, 2)}" for tick in yticks_pos1]
+    y_bottom, y_top = -10, 1
+    yticks_pos1 = [i for i in range(y_bottom, y_top, 1)]
+    yticks_pos1.append(y_top)
+    yticks_labels1 = [f"{int(tick)}" for tick in yticks_pos1]
     ax1.set_yticks(yticks_pos1)
     ax1.set_yticklabels(yticks_labels1)
-    ax1.set_ylim([min(yticks_pos1), max(yticks_pos1)])
+    ax1.set_ylim([y_bottom, y_top])
 
     ax1.set_xlim([0, iso.p_set + 1])
     xticks_pos1 = [i * 100 for i in range(int(iso.p_set / 100 + 1))]
     xticks_labels1 = [f"{int(tick)}" for tick in xticks_pos1]
     plt.xticks(xticks_pos1, xticks_labels1, rotation=0)
 
-    ax1.legend(handles=lines, loc='upper right')
+    ax1.legend(handles=lines, loc='lower right')
     ax1.grid(color='gray', linestyle='--', linewidth=0.5)
 
-    plt.savefig("./prices.svg", format="svg")
+    plt.savefig('./incremental_rate_' + file_end_name + '.svg', format="svg")
     plt.show()
 
     name = []
@@ -478,7 +572,7 @@ def draw_value_estimate_function(aggs, total_power, iso, cost_param, sample_time
         name.append("LA" + str(i + 1))
     test = pd.DataFrame(data=prices).transpose()
     test.columns = name
-    test.to_csv('./incremental_rate.csv', encoding='gbk')
+    test.to_csv('./incremental_rate_' + file_end_name + '.csv', encoding='gbk')
 
 
 def draw_beta_distribution(aggs):
@@ -548,21 +642,6 @@ def draw_uncertain_power(aggs):
     plt.show()
 
 
-def draw_beta_value_function_ISO(cost_param, p_sets, sample_time=200):
-    # 每一个p_set绘制一张图,每个图展示在某一个p_set的最优分配下，每个聚合商的不确定性系数对E的影响
-    # 即 在p_set固定的情况下，E/beta[i] 的偏导数
-
-    for p in range(len(p_sets)):
-        aggs, total_power = [AGG(200, 18, 2, 0.2), AGG(400, 36, 4, 0.3), AGG(400, 2, 2, 0.3)], p_sets[p]
-        iso = ISO(total_power, len(aggs))
-        eta, cost = assignment_gurobi(iso, aggs, cost_param)
-        for i in range(1, 200):
-            for k in range(len(aggs)):
-                aggs[k].set_beta_keep_mu((p + 1) / len(p_sets))
-
-    return 0
-
-
 def deadband(aggs, cost_param, return_flag=0):
     # E(cost)对每个聚合商c_n\eta_{sn}E(\eta_rn)的偏导数的最小P_{set}
     tmp_ans = []
@@ -583,7 +662,8 @@ def deadband(aggs, cost_param, return_flag=0):
 
 # ------ For one time dispatch Start------
 # E(Cost) / c_i\eta_{si} 的导数相等处，是optimal dispatching solution
-def get_equal_value_dispatch(iso, aggs, a, eta_init, using_aggs):
+def get_equal_value_dispatch(iso, aggs, a, mpc, eta_init, using_aggs):
+    global V_root_sqr, V_max_sqr, V_min_sqr
     not_using_aggs = []
     for i in range(len(eta_init)):
         if i not in using_aggs:
@@ -638,19 +718,43 @@ def get_equal_value_dispatch(iso, aggs, a, eta_init, using_aggs):
     formular_params_list.append([tmp_a / iso.p_set, tmp_b / iso.p_set])
     # print("s.t. formulars params list (0 <= a * \eta_{si} + b <= 1):\n", formular_params_list)
 
+    tmp_const = (V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) / 1e3  # 参考assignment_gurobi函数中的电压约束的常数部分。
+    for i in range(len(mpc["diff_V_terminate_nodes"])):  # 4为feeder数量
+        tmp_a, tmp_b, tmp_c = mpc["diff_V_terminate_nodes"][i][0], 0, 0
+        for j in not_using_aggs:
+            tmp_a += mpc["diff_V_terminate_nodes"][i][j + 1] * aggs[j].capacity * eta_init[j] * E(aggs[j])
+        for j in range(len(using_aggs)):
+            tmp_agg_id = using_aggs[j]
+            tmp_1 = mpc["diff_V_terminate_nodes"][i][tmp_agg_id + 1] * aggs[tmp_agg_id].capacity * E(aggs[tmp_agg_id])
+            tmp_b += tmp_1 * formular_params_list[j][0]
+            tmp_c += tmp_1 * formular_params_list[j][1]
+            # (V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) >= (1e3) * (mpc["diff_V_terminate_nodes"][i][0] + sum(
+            #     mpc["diff_V_terminate_nodes"][i][j + 1] * etas[j] * aggs[j].capacity * E(aggs[i])
+        formular_params_list.append([tmp_b / tmp_const, (tmp_a + tmp_c) / tmp_const])
+
+    # print("formular_params_list")
+    # for x in formular_params_list:
+    #     print(x)
+
     # 根据\eta_{si}约束，使用线性规划求解r
     manual_LP, r = True, 0
     if manual_LP:
         # 手动求解LP
         tmp_v = 9999999999
         for i in range(len(formular_params_list)):
-            tmp_up_bound = (1 - formular_params_list[i][1]) / formular_params_list[i][0]
-            tmp_low_bound = (0 - formular_params_list[i][1]) / formular_params_list[i][0]
-            if formular_params_list[i][0] < 0:
-                tmp_exchange = tmp_up_bound
-                tmp_up_bound = tmp_low_bound
-                tmp_low_bound = tmp_exchange
-            # print("tmp_r_range :", tmp_low_bound, "<= r <=", tmp_up_bound)
+            if i < len(using_aggs):
+                tmp_up_bound = (1 - formular_params_list[i][1]) / formular_params_list[i][0]
+                tmp_low_bound = (0 - formular_params_list[i][1]) / formular_params_list[i][0]
+                if formular_params_list[i][0] < 0:
+                    tmp_exchange = tmp_up_bound
+                    tmp_up_bound = tmp_low_bound
+                    tmp_low_bound = tmp_exchange
+                # print("tmp_r_range :", tmp_low_bound, "<= r <=", tmp_up_bound)
+            else:
+                if formular_params_list[i][0] < 0:
+                    continue
+                tmp_up_bound = (1 - formular_params_list[i][1]) / (formular_params_list[i][0])  # + 1e-9
+                # print("tmp_r_range :", "r <=", tmp_up_bound)
             if tmp_v >= tmp_up_bound:
                 tmp_v = tmp_up_bound
         # print("tmp_r = ", tmp_v)
@@ -662,7 +766,7 @@ def get_equal_value_dispatch(iso, aggs, a, eta_init, using_aggs):
     return r, Equivalent_distribution_ratios
 
 
-def dispatch_with_inital_state(iso, aggs, cost_param, eta_init, using_aggs):
+def dispatch_with_inital_state(iso, aggs, cost_param, mpc, eta_init, using_aggs):
     '''
     思路：计算无约束情况下的最有极值，然后如果突破边界条件的话，考虑讲最靠谱的agg剔除，然后再优化
     '''
@@ -672,9 +776,8 @@ def dispatch_with_inital_state(iso, aggs, cost_param, eta_init, using_aggs):
     # 求边际价格k
     pi, Equivalent_distribution_ratios = 0, []
     if len(using_aggs) >= 1:
-        pi, Equivalent_distribution_ratios = get_equal_value_dispatch(iso, aggs, cost_param, eta_init, using_aggs)
+        pi, Equivalent_distribution_ratios = get_equal_value_dispatch(iso, aggs, cost_param, mpc, eta_init, using_aggs)
     # print("Incremental rate for assignment:", pi)
-
     # 求边际价格为k时的分配比例
     A1 = np.zeros((len(using_aggs), len(using_aggs)))
     B1 = np.zeros((len(using_aggs), 1))
@@ -719,10 +822,11 @@ def dispatch_with_inital_state(iso, aggs, cost_param, eta_init, using_aggs):
 
 
 # ------ For get_next_inflection Start------
-def get_equal_value_inflection(aggs, a, eta_init, using_aggs, agg_j):
+def get_equal_value_inflection(aggs, a, mpc, eta_init, using_aggs, agg_j):
     # print("eta_init", eta_init)
     # print("using_aggs", using_aggs)
     # print("agg_j", agg_j)
+    global V_root_sqr, V_max_sqr, V_min_sqr
 
     # 判断agg_j替代using_aggs中的某一个时的Pset
     not_using_aggs = []
@@ -802,6 +906,23 @@ def get_equal_value_inflection(aggs, a, eta_init, using_aggs, agg_j):
     tmp_b = sum(new_formular_params_list[i][1] * aggs[using_aggs[i]].capacity for i in range(len(using_aggs)))
     tmp_b += sum(eta_init[k] * aggs[k].capacity for k in not_using_aggs) + 1
     new_formular_params_list.append([tmp_a, tmp_b])
+    # 电压约束
+    # sum(k_i*c_i*\eta_{si}*E_i) + k_0 <= const. 其中k_i为mpc中计算的常数参数,const为电压下限
+    # ==> tmp_a * P_set + tmp_b <= 1
+    tmp_const = (V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) / 1e3  # 参考assignment_gurobi函数中的电压约束的常数部分。
+    for i in range(len(mpc["diff_V_terminate_nodes"])):  # 4为feeder数量
+        tmp_a, tmp_b, tmp_c = mpc["diff_V_terminate_nodes"][i][0], 0, 0
+        for j in not_using_aggs:
+            tmp_a += mpc["diff_V_terminate_nodes"][i][j + 1] * aggs[j].capacity * eta_init[j] * E(aggs[j])
+        for j in range(len(using_aggs)):
+            tmp_agg_id = using_aggs[j]
+            tmp_1 = mpc["diff_V_terminate_nodes"][i][tmp_agg_id + 1] * aggs[tmp_agg_id].capacity * E(aggs[tmp_agg_id])
+            tmp_b += tmp_1 * new_formular_params_list[j][0]
+            tmp_c += tmp_1 * new_formular_params_list[j][1]
+
+            # (V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) >= (1e3) * (mpc["diff_V_terminate_nodes"][i][0] + sum(
+            #     mpc["diff_V_terminate_nodes"][i][j + 1] * etas[j] * aggs[j].capacity * E(aggs[i])
+        new_formular_params_list.append([tmp_b / tmp_const, (tmp_a + tmp_c) / tmp_const])
 
     formular_params_list = new_formular_params_list
     # print("formular_params_list:", formular_params_list)
@@ -815,47 +936,54 @@ def get_equal_value_inflection(aggs, a, eta_init, using_aggs, agg_j):
         tmp_pset_low = -999999999
         tmp_low_bound, last_tmp_low_bound = 0, 0
         for i in range(len(formular_params_list)):
-            tmp_up_bound = (1 - formular_params_list[i][1]) / (
-                formular_params_list[i][0] if formular_params_list[i][0] != 0 else 1e-8)
-            tmp_low_bound = (0 - formular_params_list[i][1]) / (
-                formular_params_list[i][0] if formular_params_list[i][0] != 0 else 1e-8)
-            if formular_params_list[i][0] < 0:
-                tmp_exchange = tmp_up_bound
-                tmp_up_bound = tmp_low_bound
-                tmp_low_bound = tmp_exchange
-            # print("tmp_v_range :", tmp_low_bound, "<= v <=", tmp_up_bound)
-            if tmp_pset_up >= tmp_up_bound:
-                tmp_pset_up = tmp_up_bound
-            if tmp_pset_low <= tmp_low_bound:
-                if i != len(formular_params_list) - 1:
-                    tmp_pset_low = tmp_low_bound
-            # print("tmp_v_range :", tmp_low_bound, "<= v <=", tmp_up_bound, tmp_pset_low, tmp_pset_up)
-            # print("tmp_pset_low =", tmp_pset_low, "tmp_pset_up =", tmp_pset_up)
+            if i < len(using_aggs):
+                tmp_up_bound = (1 - formular_params_list[i][1]) / (
+                    formular_params_list[i][0] if formular_params_list[i][0] != 0 else 1e-8)
+                tmp_low_bound = (0 - formular_params_list[i][1]) / (
+                    formular_params_list[i][0] if formular_params_list[i][0] != 0 else 1e-8)
+                if formular_params_list[i][0] < 0:
+                    tmp_exchange = tmp_up_bound
+                    tmp_up_bound = tmp_low_bound
+                    tmp_low_bound = tmp_exchange
+                # print("tmp_v_range :", tmp_low_bound, "<= v <=", tmp_up_bound)
+                if tmp_pset_up >= tmp_up_bound:
+                    tmp_pset_up = tmp_up_bound
+                if tmp_pset_low <= tmp_low_bound:
+                    if i != len(formular_params_list) - 1:
+                        tmp_pset_low = tmp_low_bound
+                # print("tmp_v_range :", tmp_low_bound, "<= v <=", tmp_up_bound, tmp_pset_low, tmp_pset_up)
+                # print("tmp_pset_low =", tmp_pset_low, "tmp_pset_up =", tmp_pset_up)
+            else:
+                tmp_up_bound = (1 - formular_params_list[i][1]) / (
+                    formular_params_list[i][0] if formular_params_list[i][0] != 0 else 1e-8)
+                if tmp_pset_up >= tmp_up_bound:
+                    tmp_pset_up = tmp_up_bound
+                # print("tmp_pset_up =", tmp_pset_up)
 
-        ans_Pset = 9999999999
+        ans_Pset = tmp_pset_up  # ans_Pset = 9999999999
         if tmp_pset_low > tmp_pset_up or tmp_pset_up < 0:
             ans_Pset = 9999999999  # 如果无解，那么下一个拐点是using_aggs中最先用光容量的那个Pset
-        else:
-            # 手动找到能够让r相等的那个边界
-            tmp_iso1 = ISO(tmp_pset_up, len(aggs))
-            tmp_iso2 = ISO(tmp_low_bound, len(aggs))
-            cost1, etas1 = dispatch_with_inital_state(tmp_iso1, aggs, a, eta_init, using_aggs)
-            cost2, etas2 = dispatch_with_inital_state(tmp_iso2, aggs, a, eta_init, using_aggs)
-            tmp_r1, tmp_r2 = [], []
-            tmp_deltar1, tmp_deltar2 = [], []
-            for i in range(len(aggs)):
-                tmp_r1.append(value_estimate_function(tmp_iso1, aggs, a, etas1, i))
-                tmp_r2.append(value_estimate_function(tmp_iso2, aggs, a, etas2, i))
-            for i in range(len(aggs)):
-                if i == agg_j:
-                    continue
-                else:
-                    tmp_deltar1.append(abs(tmp_r1[i] - tmp_r1[agg_j]))
-                    tmp_deltar2.append(abs(tmp_r2[i] - tmp_r2[agg_j]))
-            if min(tmp_deltar1) > min(tmp_deltar2):
-                ans_Pset = tmp_low_bound
-            else:
-                ans_Pset = tmp_pset_up
+        # else:
+        #     # 手动找到能够让r相等的那个边界
+        #     tmp_iso1 = ISO(tmp_pset_up, len(aggs))
+        #     tmp_iso2 = ISO(tmp_low_bound, len(aggs))
+        #     cost1, etas1 = dispatch_with_inital_state(tmp_iso1, aggs, a, eta_init, using_aggs)
+        #     cost2, etas2 = dispatch_with_inital_state(tmp_iso2, aggs, a, eta_init, using_aggs)
+        #     tmp_r1, tmp_r2 = [], []
+        #     tmp_deltar1, tmp_deltar2 = [], []
+        #     for i in range(len(aggs)):
+        #         tmp_r1.append(value_estimate_function(tmp_iso1, aggs, a, etas1, i))
+        #         tmp_r2.append(value_estimate_function(tmp_iso2, aggs, a, etas2, i))
+        #     for i in range(len(aggs)):
+        #         if i == agg_j:
+        #             continue
+        #         else:
+        #             tmp_deltar1.append(abs(tmp_r1[i] - tmp_r1[agg_j]))
+        #             tmp_deltar2.append(abs(tmp_r2[i] - tmp_r2[agg_j]))
+        #     if min(tmp_deltar1) > min(tmp_deltar2):
+        #         ans_Pset = tmp_low_bound
+        #     else:
+        #         ans_Pset = tmp_pset_up
 
         # print("tmp_Pset =", tmp_pset_up)
         # \eta_{si} = a * r + b * Pset + c
@@ -866,89 +994,13 @@ def get_equal_value_inflection(aggs, a, eta_init, using_aggs, agg_j):
     return ans_Pset, ans_eta_V_Pset_const
 
 
-# (没有使用。目前可以解决r=0且\eta_{si}=1导致的turning point，还解决不了r<0的情况)
-# 当前using_agg只有一个agg时，估计其被完全调用时(\eta_{s0}=1)所处的Pset
-def get_one_agg_final_point(aggs, a, eta_init, using_aggs):
-    tmp_i = using_aggs[0]
-    eta_init[tmp_i] = 1.0
-
-    # r = k1 * Pset + k2
-    k1 = -2 * a[2] * E(aggs[tmp_i])
-    k2 = (E(aggs[tmp_i]) * (aggs[tmp_i].price_param - a[1])
-          + 2 * a[2] * aggs[tmp_i].capacity * 1 * Var(aggs[tmp_i]))
-    for j in range(len(aggs)):
-        k2 += 2 * a[2] * aggs[j].capacity * eta_init[j] * (E(aggs[j]) * E(aggs[tmp_i]))
-
-    not_using_aggs = []
-    for i in range(len(aggs)):
-        if i != tmp_i:
-            not_using_aggs.append(i)
-    print("NLAS:", not_using_aggs)
-    print("ALAS:", using_aggs)
-    print("eta_init:", eta_init)
-
-    # tmp_a * \eta_{si} = tmp_b * r + tmp_c * iso.p_set + tmp_const, 此处是指using_aggs中的第1个agg_id, r为price
-    # 此处公式是按照Incremental rate推导的, (Incremental rate = -1.0 * \frac{\partial E(Cost)}{\partial c_i\eta_{si}})
-    tmp_a = 2.0 * a[2] * aggs[tmp_i].capacity * Var(aggs[tmp_i]) \
-            + 2.0 * a[2] * aggs[tmp_i].capacity * E(aggs[tmp_i]) * E(aggs[tmp_i])
-
-    tmp_const = E(aggs[tmp_i]) * (a[1] - aggs[tmp_i].price_param) \
-                - 2.0 * a[2] * E(aggs[tmp_i]) * \
-                (sum(aggs[k].capacity * eta_init[k] * E(aggs[k]) for k in not_using_aggs))
-
-    tmp_b = 1.0
-
-    tmp_c = 2.0 * a[2] * E(aggs[tmp_i])
-
-    # eta_si = t1 * Pset + t2
-    t1 = (-tmp_b * k1 + tmp_c) / tmp_a
-    t2 = (-tmp_b * k2 + tmp_const) / tmp_a
-
-    # s.t. r<=0
-    c1 = -k2 / k1
-    print(c1, "<= Pset")
-
-    # s.t. 0<=\eta_i<=1
-    c2 = (1 - t2) / t1
-    c3 = -t2 / t1
-    print(c3, "<= Pset <=", c2)
-
-    # s.t. sum(c_i\eta_{si}<=Pset)
-    others = 0
-    for i in range(len(aggs)):
-        if i != tmp_i:
-            others += aggs[i].capacity * eta_init[i]
-    # (t1*Pset+t2)*aggs[tmp_i]<=Pset-others
-    # (t1-1/aggs[tmp_i])Pset<=-1/aggs[tmp_i]*(others)-t2
-    c4 = (-1 / aggs[tmp_i].capacity * (others) - t2) / (t1 - 1 / aggs[tmp_i].capacity)
-    print("Pset <=", c4)
-
-    # objective: max r   =>   min Pset
-    next_Pset = min(c2, c4)  # 在允许的范围内最小的Pset就是LA_i容量用尽时，下一个拐点的位置
-
-    # debug. verify increment at a certain turning point.
-    print("\nCalculated next_Pset:", next_Pset)
-    p_set = next_Pset
-    print("r =", k1 * p_set + k2)
-    eta_i = (tmp_b * (k1 * p_set + k2) + tmp_c * p_set + tmp_const) / tmp_a
-    print("eta_i =", eta_i, "(should be 1.0)")
-
-    p_set = 1200
-    print("\nIf p_set=", p_set)
-    r = k1 * p_set + k2
-    print("r =", r)
-    eta_i = (tmp_b * (k1 * p_set + k2) + tmp_c * p_set + tmp_const) / tmp_a
-    # eta_i = (tmp_b * r + tmp_c * p_set + tmp_const) / tmp_a
-    print("eta_i =", eta_i, "(should be 1.0)")
-
-    return next_Pset
-
-
 # 求解using_agg中有多个聚合商时，由于聚合商之间不能维持边际价值相等的状态导致的拐点
-def get_equal_aggs_inflection_end(aggs, a, eta_init, using_aggs, agg_j):
+def get_equal_aggs_inflection_end(aggs, a, mpc, eta_init, using_aggs, agg_j):
     # 获取多个aggs等价的终点处的Pset
     # agg_j就是using_aggs中触碰上边界eta_{si}=1的那个聚合商,传入的using_aggs已经将其移除了
 
+    global V_root_sqr, V_max_sqr, V_min_sqr
+    # print("get_equal_aggs_inflection_end", agg_j)
     # print("\nusing_aggs", using_aggs, agg_j)
     # print("eta_init", eta_init)
 
@@ -956,6 +1008,7 @@ def get_equal_aggs_inflection_end(aggs, a, eta_init, using_aggs, agg_j):
     for i in range(len(eta_init)):
         if i not in using_aggs:
             not_using_aggs.append(i)
+    last_pset = sum(eta_init[i] * aggs[i].capacity for i in range(len(aggs)))
     # print("not_using_aggs:", not_using_aggs)
 
     formular_params_list = []  # [[a, b, c]]   \eta_{si} = a * V + b * Pset + c
@@ -1020,7 +1073,6 @@ def get_equal_aggs_inflection_end(aggs, a, eta_init, using_aggs, agg_j):
     v2 = (eta_init[agg_j] - tmp_formular_params_list_agg_j[2]) / tmp_formular_params_list_agg_j[0]
     # print("v1, v2", v1, v2)
     del formular_params_list[-1]
-
     ans_eta_V_Pset_const = copy.deepcopy(formular_params_list)
 
     new_formular_params_list = []
@@ -1035,6 +1087,23 @@ def get_equal_aggs_inflection_end(aggs, a, eta_init, using_aggs, agg_j):
     tmp_b += sum(eta_init[k] * aggs[k].capacity for k in not_using_aggs) + 1
     new_formular_params_list.append([tmp_a, tmp_b])
 
+    # 电压约束
+    # sum(k_i*c_i*\eta_{si}*E_i) + k_0 <= const. 其中k_i为mpc中计算的常数参数,const为电压下限
+    # ==> tmp_a * P_set + tmp_b <= 1
+    tmp_const = (V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) / 1e3  # 参考assignment_gurobi函数中的电压约束的常数部分。
+    for i in range(len(mpc["diff_V_terminate_nodes"])):
+        # (V_root_sqr - V_min_sqr) * (10 * 10 * 1e6) >= (1e3) * (mpc["diff_V_terminate_nodes"][i][0] + sum(
+        #     mpc["diff_V_terminate_nodes"][i][j + 1] * etas[j] * aggs[j].capacity * E(aggs[i])
+        tmp_a, tmp_b, tmp_c = mpc["diff_V_terminate_nodes"][i][0], 0, 0
+        for j in not_using_aggs:
+            tmp_a += mpc["diff_V_terminate_nodes"][i][j + 1] * aggs[j].capacity * eta_init[j] * E(aggs[j])
+        for j in range(len(using_aggs)):
+            tmp_agg_id = using_aggs[j]
+            tmp_1 = mpc["diff_V_terminate_nodes"][i][tmp_agg_id + 1] * aggs[tmp_agg_id].capacity * E(aggs[tmp_agg_id])
+            tmp_b += tmp_1 * new_formular_params_list[j][0]
+            tmp_c += tmp_1 * new_formular_params_list[j][1]
+        new_formular_params_list.append([tmp_b / tmp_const, (tmp_a + tmp_c) / tmp_const])
+
     formular_params_list = new_formular_params_list
     # print("formular_params_list:(Pset,Const)", formular_params_list)
 
@@ -1047,56 +1116,68 @@ def get_equal_aggs_inflection_end(aggs, a, eta_init, using_aggs, agg_j):
         tmp_pset_low = -999999999
 
         for i in range(len(formular_params_list)):
-            tmp_up_bound = (1 - formular_params_list[i][1]) / formular_params_list[i][0]
-            tmp_low_bound = (0 - formular_params_list[i][1]) / formular_params_list[i][0]
-            if formular_params_list[i][0] < 0:
-                tmp_exchange = tmp_up_bound
-                tmp_up_bound = tmp_low_bound
-                tmp_low_bound = tmp_exchange
+            if i < len(using_aggs):
+                tmp_up_bound = (1 - formular_params_list[i][1]) / formular_params_list[i][0]
+                tmp_low_bound = (0 - formular_params_list[i][1]) / formular_params_list[i][0]
+                if formular_params_list[i][0] < 0:
+                    tmp_exchange = tmp_up_bound
+                    tmp_up_bound = tmp_low_bound
+                    tmp_low_bound = tmp_exchange
 
-            if tmp_pset_up >= tmp_up_bound:
-                tmp_pset_up = tmp_up_bound
-            if tmp_pset_low <= tmp_low_bound:
-                if i != len(formular_params_list) - 1:
-                    tmp_pset_low = tmp_low_bound
-            # print("tmp_Pset_range :", tmp_pset_low, "<= r <=", tmp_pset_up, tmp_low_bound, tmp_up_bound)
+                if tmp_pset_up >= tmp_up_bound:
+                    tmp_pset_up = tmp_up_bound
+                if tmp_pset_low <= tmp_low_bound:
+                    if i != len(formular_params_list) - 1:
+                        tmp_pset_low = tmp_low_bound
+                # print("tmp_v_range :", tmp_low_bound, "<= v <=", tmp_up_bound, tmp_pset_low, tmp_pset_up)
+                # print("tmp_pset_low =", tmp_pset_low, "tmp_pset_up =", tmp_pset_up)
+            else:
+                tmp_up_bound = (1 - formular_params_list[i][1]) / (
+                    formular_params_list[i][0] if formular_params_list[i][0] != 0 else 1e-8)
+                if tmp_pset_up >= tmp_up_bound:
+                    tmp_pset_up = tmp_up_bound
+                # print("tmp_pset_up =", tmp_pset_up)
 
-        ans_Pset = 999999999
+        # print("tmp_pset_low =", tmp_pset_low, "tmp_pset_up =", tmp_pset_up)
+        ans_Pset = tmp_pset_up  # 999999999
         if tmp_pset_low > tmp_pset_up or tmp_pset_up < 0:
             ans_Pset = 9999999999  # 如果无解，那么下一个拐点是using_aggs中最先用光容量的那个Pset
         else:
-            # 这么做的原因：由于期望影响\eta_{si}超调欠调,
-            # sum(c_i_eta_{si}, i\in LAS)的期望可能大于1也可能小于1，因此sum-Pset的符号不固定
-            # 进而导致最有一个不等式的不等号的方向也不固定可能是up<Pset<low, 也可能是low<pset<up
+            if tmp_pset_low > last_pset:
+                ans_Pset = tmp_pset_low
+        # else:
+        #     # 这么做的原因：由于期望影响\eta_{si}超调欠调,
+        #     # sum(c_i_eta_{si}, i\in LAS)的期望可能大于1也可能小于1，因此sum-Pset的符号不固定
+        #     # 进而导致最有一个不等式的不等号的方向也不固定可能是up<Pset<low, 也可能是low<pset<up
+        #
+        #     # 手动找到能够让r相等的那个边界
+        #     tmp_iso1 = ISO(tmp_pset_up, len(aggs))
+        #     tmp_iso2 = ISO(tmp_low_bound, len(aggs))
+        #     cost1, etas1 = dispatch_with_inital_state(tmp_iso1, aggs, a, eta_init, using_aggs)
+        #     cost2, etas2 = dispatch_with_inital_state(tmp_iso2, aggs, a, eta_init, using_aggs)
+        #     tmp_r1, tmp_r2 = [], []
+        #     tmp_deltar1, tmp_deltar2 = [], []
+        #     for i in range(len(aggs)):
+        #         tmp_r1.append(value_estimate_function(tmp_iso1, aggs, a, etas1, i))
+        #         tmp_r2.append(value_estimate_function(tmp_iso2, aggs, a, etas2, i))
+        #     for i in range(len(aggs)):
+        #         if i == agg_j:
+        #             continue
+        #         else:
+        #             tmp_deltar1.append(abs(tmp_r1[i] - tmp_r1[agg_j]))
+        #             tmp_deltar2.append(abs(tmp_r2[i] - tmp_r2[agg_j]))
+        #     if min(tmp_deltar1) > min(tmp_deltar2):
+        #         ans_Pset = tmp_low_bound
+        #     else:
+        #         ans_Pset = tmp_pset_up
 
-            # 手动找到能够让r相等的那个边界
-            tmp_iso1 = ISO(tmp_pset_up, len(aggs))
-            tmp_iso2 = ISO(tmp_low_bound, len(aggs))
-            cost1, etas1 = dispatch_with_inital_state(tmp_iso1, aggs, a, eta_init, using_aggs)
-            cost2, etas2 = dispatch_with_inital_state(tmp_iso2, aggs, a, eta_init, using_aggs)
-            tmp_r1, tmp_r2 = [], []
-            tmp_deltar1, tmp_deltar2 = [], []
-            for i in range(len(aggs)):
-                tmp_r1.append(value_estimate_function(tmp_iso1, aggs, a, etas1, i))
-                tmp_r2.append(value_estimate_function(tmp_iso2, aggs, a, etas2, i))
-            for i in range(len(aggs)):
-                if i == agg_j:
-                    continue
-                else:
-                    tmp_deltar1.append(abs(tmp_r1[i] - tmp_r1[agg_j]))
-                    tmp_deltar2.append(abs(tmp_r2[i] - tmp_r2[agg_j]))
-            if min(tmp_deltar1) > min(tmp_deltar2):
-                ans_Pset = tmp_low_bound
-            else:
-                ans_Pset = tmp_pset_up
-
-        # print("tmp_Pset =", tmp_pset_up)
+        # print("tmp_Pset =", ans_Pset)
     # print("\n")
     return ans_Pset, ans_eta_V_Pset_const
 
 
-# 求解有最优微增量的聚合商被完全调用不得不推出ALA时的Pset
-def get_Pset_of_Euqal_agg_end_point(iso, aggs, cost_param, eta_init, using_aggs):
+# 求解有最优微增量的聚合商被完全调用不得不退出ALA时的Pset
+def get_Pset_of_Euqal_agg_end_point(iso, aggs, cost_param, mpc, eta_init, using_aggs):
     # print("input of get_Pset_of_Euqal_agg_end_point:", iso.p_set, eta_init, using_aggs)
     # 200.9999999999174 [0, np.float64(0.9999999999991739), 0, np.float64(0.9999999999999998), 0] [4]
 
@@ -1118,19 +1199,18 @@ def get_Pset_of_Euqal_agg_end_point(iso, aggs, cost_param, eta_init, using_aggs)
         next_Pset = iso.p_set + (1 - eta_init[using_aggs[0]]) * aggs[using_aggs[0]].capacity * max(1,
                                                                                                    E(aggs[using_aggs[
                                                                                                        0]]))
-        # next_Pset = get_one_agg_final_point(aggs, cost_param, eta_init, using_aggs)
         # print("DEBUG next_Pset:", next_Pset)
         # print("----------------------")
         return next_Pset
-    elif len(using_aggs) >= 1:
-        # 获取多个等价agg达到某一个agg的容量上限处的Pset.(using_agg内部某个成员无法维持最高的边际价值导致拐点)
+    elif len(using_aggs) >= 2:
+        # 获取using_agg内部某个成员无法维持最高的边际价值导致拐点的Pset.
         # print("\n------finding Pset of multi-aggs end------")
         next_Psets = []
         for i in range(len(using_aggs)):
             tmp_eta_init = copy.deepcopy(eta_init)
             tmp_eta_init[using_aggs[i]] = 1.0
             tmp_using_aggs = [x for x in using_aggs if x != using_aggs[i]]
-            next_Pset, b = get_equal_aggs_inflection_end(aggs, cost_param, tmp_eta_init, tmp_using_aggs,
+            next_Pset, b = get_equal_aggs_inflection_end(aggs, cost_param, mpc, tmp_eta_init, tmp_using_aggs,
                                                          using_aggs[i])
             tmp_iso1 = iso
             tmp_iso1.p_set = next_Pset
@@ -1142,7 +1222,7 @@ def get_Pset_of_Euqal_agg_end_point(iso, aggs, cost_param, eta_init, using_aggs)
         return 999999999
 
 
-# 求解当前ALA额外i空集时，NLA中某聚合商的微增量刚刚<0时的解（由于ALA为空，微增量<0就是最优微增量）
+# 求解当前ALA为空集时，NLA中某聚合商的微增量刚刚<0时的解（由于ALA为空，微增量<0就是最优微增量）
 def get_next_value_eq_0(aggs, a, etas, i):
     # 当前eta_init下使得using_aggs为空，求下一次using_aggs不为空时，P_set的值
     a1 = -aggs[i].capacity * E(aggs[i]) * a[1] + 2 * a[2] * aggs[i].capacity * aggs[i].capacity * etas[i] * Var(
@@ -1153,7 +1233,7 @@ def get_next_value_eq_0(aggs, a, etas, i):
     return a1 / b1
 
 
-def get_inflection_positions(iso, aggs, cost_param):
+def get_inflection_positions(iso, aggs, cost_param, mpc):
     # Calculate Pset if existing aggs[j] could replace any one of using_aggs
     tmp_iso = copy.deepcopy(iso)
     positions = [[0, [0 for i in range(len(aggs))], []]]
@@ -1191,7 +1271,7 @@ def get_inflection_positions(iso, aggs, cost_param):
     first_after_skip_area = True
     last_skip_Pset_range = positions[-1][0] - positions[-2][0]
 
-    # next_Pset, eta_V_Pset_const = get_equal_value_inflection(aggs, cost_param, next_eta_init, next_using_aggs, 2)
+    # next_Pset, eta_V_Pset_const = get_equal_value_inflection(aggs, cost_param, mpc, next_eta_init, next_using_aggs, 2)
     # print("------next_Pset", next_Pset, deadbands[2])
     wjc_it = 0
     while next_Pset < iso.p_set:
@@ -1231,7 +1311,7 @@ def get_inflection_positions(iso, aggs, cost_param):
             # ------
         else:
             # 当前using_aggs不为空
-            # print("\n------current_Pset", next_Pset, wjc_it, "--------")
+            # print("\n---iter", wjc_it, "current_Pset", next_Pset, next_using_aggs, "--------")
             # set current state
             not_using_aggs, full_used_aggs = [], []
             for j in range(len(next_eta_init)):
@@ -1240,19 +1320,21 @@ def get_inflection_positions(iso, aggs, cost_param):
                 if abs(next_eta_init[j] - 1) < 1e-5:
                     full_used_aggs.append(j)
             current_using_aggs = copy.deepcopy(next_using_aggs)
+            # current_Pset = next_Pset
             # print("not_using_aggs:", not_using_aggs)
             # update Pset
             next_Psets = []
             for i in range(len(aggs)):
                 if i in not_using_aggs:
-                    # print(next_eta_init, next_using_aggs, i)
-                    next_Pset, _ = get_equal_value_inflection(aggs, cost_param, next_eta_init, next_using_aggs, i)
+                    # print(i, next_eta_init, next_using_aggs)
+                    next_Pset, _ = get_equal_value_inflection(aggs, cost_param, mpc, next_eta_init, next_using_aggs, i)
                     # print("tmp_next_Pset1", next_Pset)
                     # verify Value of aggs on the end position to avoid numbercial computation accuracy
                     if next_Pset < 999999:
                         tmp_iso1 = copy.deepcopy(iso)
                         tmp_iso1.p_set = next_Pset
-                        _, tmp_next_eta_init = dispatch_with_inital_state(tmp_iso1, aggs, cost_param, next_eta_init,
+                        _, tmp_next_eta_init = dispatch_with_inital_state(tmp_iso1, aggs, cost_param, mpc,
+                                                                          next_eta_init,
                                                                           next_using_aggs)
                         # print("tmp_next_eta_init", tmp_next_eta_init)
                         tmp_next_V = []
@@ -1263,7 +1345,9 @@ def get_inflection_positions(iso, aggs, cost_param):
                                 tmp_next_V.append(
                                     value_estimate_function(tmp_iso1, aggs, cost_param, tmp_next_eta_init, j))
                         # print("tmp_next_V", tmp_next_V, next_using_aggs[0], i)
-                        if abs(tmp_next_V[next_using_aggs[0]] - tmp_next_V[i]) > 1e-3:
+                        # if abs(tmp_next_V[next_using_aggs[0]] - tmp_next_V[i]) > 1e-3:
+                        #     next_Psets.append(9999999999)
+                        if tmp_next_V[i] < 1e-3:  # 和上面2行if注释选用一个
                             next_Psets.append(9999999999)
                         else:
                             next_Psets.append(next_Pset)
@@ -1272,8 +1356,9 @@ def get_inflection_positions(iso, aggs, cost_param):
                 else:
                     next_Psets.append(7777777777)
             # print("next_Psets(0):", next_Psets)
+            # print("Euqal_agg_end_point:")
             next_Psets.append(
-                get_Pset_of_Euqal_agg_end_point(tmp_iso, aggs, cost_param, next_eta_init, next_using_aggs))
+                get_Pset_of_Euqal_agg_end_point(tmp_iso, aggs, cost_param, mpc, next_eta_init, next_using_aggs))
             # print("next_Psets(1):", next_Psets)
             # print("first_after_skip_area", first_after_skip_area)
             if first_after_skip_area:
@@ -1291,7 +1376,8 @@ def get_inflection_positions(iso, aggs, cost_param):
 
                 # update eta_init
                 tmp_iso.p_set = next_Pset
-                _, next_eta_init = dispatch_with_inital_state(tmp_iso, aggs, cost_param, next_eta_init, next_using_aggs)
+                _, next_eta_init = dispatch_with_inital_state(tmp_iso, aggs, cost_param, mpc, next_eta_init,
+                                                              next_using_aggs)
                 # print("next_eta_init:", next_eta_init)
 
                 # update using_aggs
@@ -1329,19 +1415,14 @@ def get_inflection_positions(iso, aggs, cost_param):
 
 # ------ For get_next_inflection End------
 
-def draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_times=600, draw=False):
-    draw_p_set, draw_etas, draw_costs = [], [], []
+def draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, mpc, sample_times=600, draw=False):
+    draw_p_set, draw_etas, draw_costs, draw_costs_PAM = [], [], [], []
     for i in range(len(aggs)):
         draw_etas.append([])
 
     # 按顺序求所有分配规则变化的节点
     tmp_iso = copy.deepcopy(iso)
-    positions = get_inflection_positions(iso, aggs, cost_param)
-    # positions = [[0, [0, 0, 0], []],
-    #              [10.0, [0, 0, 0], [0]],
-    #              [400.0, [1, 0, 0], [2]],
-    #              [540, [1, 0, 0.35], [1, 2]],
-    #              [720, [1, 1, 0.3], [2]]]
+    positions = get_inflection_positions(iso, aggs, cost_param, mpc)
     positions.append([99999999999, [], []])
     print("Critical positions:")
     for i in range(len(positions)):
@@ -1374,12 +1455,12 @@ def draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_time
         else:
             tmp_iso.p_set = tmp_Pset
             tmp_eta_init, tmp_using_aggs = positions[stage_id][1], positions[stage_id][2]
-            cost, etas = dispatch_with_inital_state(tmp_iso, aggs, cost_param, tmp_eta_init, tmp_using_aggs)
+            cost, etas = dispatch_with_inital_state(tmp_iso, aggs, cost_param, mpc, tmp_eta_init, tmp_using_aggs)
             # if abs(tmp_Pset - 700) < 1:
             #     print("debug", tmp_iso.p_set, tmp_eta_init, tmp_using_aggs)
         # print(etas)
         # print("MyCode", i, cost, etas)
-        # cost, etas = assignment_gurobi(tmp_iso, aggs, cost_param)
+        # cost, etas, _ = assignment_gurobi(tmp_iso, aggs, cost_param)
         # print("Gurobi:", cost, etas)
 
         draw_p_set.append(Pset_list[i])
@@ -1388,10 +1469,34 @@ def draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_time
         draw_costs.append(cost)
         # print(np.round(Pset_list[i], 2), "MW stage_id", stage_id, np.round(cost, 2), np.round(etas, 2))
 
+        # calculate cost by PAM method
+        if i <= 425:
+            cost_PAM, etas_PAM = assignment_PAM(tmp_iso, aggs, cost_param, mpc)
+            draw_costs_PAM.append(cost_PAM)
+        # else:
+        #     draw_costs_PAM.append(9999)
+
     # 设置图形大小和线条颜色
     fig = plt.figure()
     ax1 = fig.add_subplot(111)
     lines = []
+
+    # draw cost curves
+    # ax2 = ax1.twinx()
+    # line, = ax2.plot(draw_p_set, draw_costs, color='#E7DAD2', linestyle='--', label="cost by TEIRP-PDA")
+    # lines.append(line)
+    # line, = ax2.plot(draw_p_set[:len(draw_costs_PAM)], draw_costs_PAM, color='#999999', linestyle='--',
+    #                  label="cost by PAM")
+    # lines.append(line)
+    # ax2.set_ylabel(r"Expectation of Cost (\$)   ")
+    # delta_y = 250
+    # ax2.set_ylim([0, 5 * delta_y])
+    # yticks_pos2 = [0, 1 * delta_y, 2 * delta_y, 3 * delta_y, 4 * delta_y, 5 * delta_y]
+    # yticks_labels2 = [f'{int(tick)}' for tick in yticks_pos2]
+    # ax2.set_yticks(yticks_pos2)
+    # ax2.set_yticklabels(yticks_labels2)
+
+    # draw distribution result curves
     for i in range(len(aggs)):
         line, = ax1.plot(draw_p_set, draw_etas[i], label="LA" + str(i + 1))
         lines.append(line)
@@ -1409,25 +1514,11 @@ def draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_time
     ax1.set_yticks(yticks_pos1)
     ax1.set_yticklabels(yticks_labels1)
 
-    ax2 = ax1.twinx()
-    line, = ax2.plot(draw_p_set, draw_costs, color='#17becf', linestyle='--', label="cost")
-    lines.append(line)
-    ax2.set_ylabel(r"Expectation of Cost (\$)   ")
-    delta_y = 150
-    ax2.set_ylim([0, 5 * delta_y])
-    yticks_pos2 = [0, 1 * delta_y, 2 * delta_y, 3 * delta_y, 4 * delta_y, 5 * delta_y]
-    yticks_labels2 = [f'{int(tick)}' for tick in yticks_pos2]
-    ax2.set_yticks(yticks_pos2)
-    ax2.set_yticklabels(yticks_labels2)
-
     # ax1.legend(handles=lines, loc='upper left', bbox_to_anchor=(1.1, 1), borderaxespad=0.)
     ax1.legend(handles=lines, loc='upper left')
     ax1.grid(color='gray', linestyle='--', linewidth=0.5)
 
     plt.subplots_adjust(right=0.8)
-
-    plt.savefig("./2stage-assignment.svg", format="svg")
-    plt.show()
 
     # print("Costs:", costs)
     # print("Dispatching etas:", etas)
@@ -1441,12 +1532,45 @@ def draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_time
     test.columns = ["cost"]
     test.to_csv('./2stage_cost.csv', encoding='gbk')
 
+    plt.savefig("./2stage-assignment.svg", format="svg")
+    # plt.show()
 
-def two_stage_dynamic_dispatch_algorithm_time(iso, aggs, cost_param, sample_times=600):
+    ## draw cost curves
+    fig = plt.figure()
+    ax2 = fig.add_subplot(111)
+    lines = []
+    line, = ax2.plot(draw_p_set, draw_costs, color='#FFBE7A', linestyle='--', label="TEIRP-PDA/IPM")
+    lines.append(line)
+    line, = ax2.plot(draw_p_set[:len(draw_costs_PAM)], draw_costs_PAM, color='#FA7F6F', linestyle='--',
+                     label="PAM")
+    lines.append(line)
+
+    ax2.set_xlabel(r"$P_{AGC}$ (MW)")
+    ax2.set_xlim([0, 1000 + 1])
+    xticks_pos1 = [i * 100 for i in range(int(1000 / 100 + 1))]
+    xticks_labels1 = [f"{int(tick)}" for tick in xticks_pos1]
+    plt.xticks(xticks_pos1, xticks_labels1, rotation=0)
+
+    ax2.set_ylabel(r"Expectation of Cost (\$)   ")
+    delta_y = 200
+    ax2.set_ylim([0, 5 * delta_y])
+    yticks_pos2 = [0, 1 * delta_y, 2 * delta_y, 3 * delta_y, 4 * delta_y, 5 * delta_y]
+    yticks_labels2 = [f'{int(tick)}' for tick in yticks_pos2]
+    ax2.set_yticks(yticks_pos2)
+    ax2.set_yticklabels(yticks_labels2)
+
+    ax2.legend(handles=lines, loc='upper left')
+    ax2.grid(color='gray', linestyle='--', linewidth=0.5)
+
+    plt.savefig("./cost.svg", format="svg")
+    plt.show()
+
+
+def two_stage_dynamic_dispatch_algorithm_time(iso, aggs, cost_param, mpc, sample_times=600):
     # 按顺序求所有分配规则变化的节点
     start_time = time.time()
     tmp_iso = copy.deepcopy(iso)
-    positions = get_inflection_positions(iso, aggs, cost_param)
+    positions = get_inflection_positions(iso, aggs, cost_param, mpc)
     positions.append([99999999999, [], []])
     end_time = time.time()
     stage1_time = end_time - start_time
@@ -1480,10 +1604,10 @@ def two_stage_dynamic_dispatch_algorithm_time(iso, aggs, cost_param, sample_time
         else:
             tmp_iso.p_set = tmp_Pset
             tmp_eta_init, tmp_using_aggs = positions[stage_id][1], positions[stage_id][2]
-            cost, etas = dispatch_with_inital_state(tmp_iso, aggs, cost_param, tmp_eta_init, tmp_using_aggs)
+            cost, etas = dispatch_with_inital_state(tmp_iso, aggs, cost_param, mpc, tmp_eta_init, tmp_using_aggs)
 
         # print("MyCode", cost, etas)
-        # cost, etas = assignment_gurobi(tmp_iso, aggs, cost_param)
+        # cost, etas, _ = assignment_gurobi(tmp_iso, aggs, cost_param, mpc)
         # print("Gurobi:", cost, E_cost_function(aggs, tmp_iso, cost_param, etas), etas)
     end_time = time.time()
     stage2_time = end_time - start_time
@@ -1491,10 +1615,10 @@ def two_stage_dynamic_dispatch_algorithm_time(iso, aggs, cost_param, sample_time
     return stage1_time, stage2_time
 
 
-def two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param):
+def two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param, mpc):
     # 按顺序求所有分配规则变化的节点
     tmp_iso = copy.deepcopy(iso)
-    positions = get_inflection_positions(iso, aggs, cost_param)
+    positions = get_inflection_positions(iso, aggs, cost_param, mpc)
     positions.append([99999999999, [], []])
 
     # print("positions:")
@@ -1508,7 +1632,7 @@ def two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param):
         if tmp_Pset <= positions[j][0]:
             stage_id = j - 1
             break
-    # print("stage_id", stage_id, tmp_Pset, positions[stage_id][0])
+    print("stage_id", stage_id, tmp_Pset, positions[stage_id][0])
     cost, etas = 0, []
     if stage_id == len(positions) - 2:
         tmp_iso.p_set = tmp_Pset
@@ -1517,22 +1641,25 @@ def two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param):
     else:
         tmp_iso.p_set = tmp_Pset
         tmp_eta_init, tmp_using_aggs = positions[stage_id][1], positions[stage_id][2]
-        cost, etas = dispatch_with_inital_state(tmp_iso, aggs, cost_param, tmp_eta_init, tmp_using_aggs)
+        cost, etas = dispatch_with_inital_state(tmp_iso, aggs, cost_param, mpc, tmp_eta_init, tmp_using_aggs)
     return cost, etas
 
 
-def test_gurobi_time(iso, aggs, cost_param, sample_times=600):
+def test_gurobi_time(iso, aggs, cost_param, mpc, sample_times=600, method="gurobi"):
     Pset_list = [i / sample_times * iso.p_set for i in range(0, sample_times, 2)]
     tmp_iso = copy.deepcopy(iso)
+    total_t = 0
     for i in range(len(Pset_list)):
         tmp_Pset = Pset_list[i]
         tmp_iso.p_set = tmp_Pset
-        cost, etas = assignment_gurobi(tmp_iso, aggs, cost_param)
-    return 0
+        cost, etas, t = assignment_gurobi(tmp_iso, aggs, cost_param, mpc, method)
+        total_t = total_t + t
+    return total_t
 
 
 def generate_mass_aggs(N):
     aggs = []
+    np.random.seed(0)
     prices = np.random.uniform(0.1, 10.0, N)
     k = 0
     for i in range(10):
@@ -1540,303 +1667,6 @@ def generate_mass_aggs(N):
             aggs.append(AGG(10, i + 1, j + 1, prices[k]))
             k += 1
     return aggs
-
-
-def draw_time(cost_param, my_sample_times):
-    gurobi_times = []
-    two_stage_times = []
-    stage1_times, stage2_times = [], []
-
-    for i in range(1, 9):
-        print("Number of AGGs:", int(i * 10))
-        aggs = generate_mass_aggs(int(i * 10))
-
-        total_power = i * 10 * 10
-        iso = ISO(total_power, len(aggs))
-        start_time = time.time()
-        stage1_time, stage2_time = two_stage_dynamic_dispatch_algorithm_time(iso, aggs, cost_param,
-                                                                             sample_times=my_sample_times)
-        end_time = time.time()
-        two_stage_time = end_time - start_time
-        start_time = time.time()
-        test_gurobi_time(iso, aggs, cost_param, sample_times=my_sample_times)
-        end_time = time.time()
-        gurobi_time = end_time - start_time
-
-        gurobi_times.append(gurobi_time)
-        two_stage_times.append(two_stage_time)
-        stage1_times.append(stage1_time)
-        stage2_times.append(stage2_time)
-        print(i, stage1_time, stage2_time, gurobi_time, "s")
-    print(stage1_times, stage2_times, gurobi_times)
-
-    a, b, c = gurobi_times, stage1_times, stage2_times
-    # 设置 x 轴标签
-    labels = [f'{(i + 1) * 10}' for i in range(len(a))]
-
-    x = np.arange(len(labels))  # the label locations
-    width = 0.35  # the width of the bars
-
-    plt.figure()
-
-    # 绘制 a 的柱子
-    plt.bar(x - width / 2, a, label='Interior point method', width=0.3)
-
-    # 绘制 b 和 c 组合的柱子
-    bottom_c = [0] * len(c)
-    for i in range(len(c)):
-        if i == 0:
-            plt.bar(x[i] + width / 2, c[i], bottom=bottom_c[i], label='TEIRP-PDA', color='red',
-                    width=0.3)
-            bottom_c[i] += c[i]
-        else:
-            plt.bar(x[i] + width / 2, c[i], bottom=bottom_c[i], color='red', width=0.3)
-            bottom_c[i] += c[i]
-    # for i in range(len(b)):
-    #     if i == 0:
-    #         plt.bar(x[i] + width / 2, b[i], bottom=bottom_c[i], label='Stage 1', color='green', width=0.3)
-    #     else:
-    #         plt.bar(x[i] + width / 2, b[i], bottom=bottom_c[i], color='green', width=0.3)
-
-    # 设置 x 轴标签和标题
-    plt.xticks(range(len(a)), labels)
-    plt.xlabel('Number of Load Aggregators')
-    plt.ylabel('Execution Time of Determining Real-time Power Distribution (s)')
-
-    # 添加图例
-    plt.legend()
-
-    # 显示图形
-    plt.savefig("./time.svg", format="svg")
-    plt.show()
-    return 0
-
-
-def continue_use_id_cost(p_set, aggs, cost_param):
-    iso = ISO(p_set, len(aggs))
-    cost_init, eta_init = two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param)
-    # print("pset_init", iso.p_set, "cost_init", cost_init, "eta_init", eta_init)
-
-    # 计算强制调用某一agg的话，Cost的变化
-    cost1, cost3, cost_optimal = [], [], []
-    for i in range(11):
-        p = i * 0.1
-        iso.p_set = p_set + p
-        tmp_cost, _ = two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param)
-        cost_optimal.append(tmp_cost)
-    eta = copy.deepcopy(eta_init)
-    for i in range(11):
-        p = i * 0.1
-        # eta[1] = eta_init[1] + p / aggs[1].capacity
-        iso.p_set = p_set + p
-        # cost1.append(E_cost_function(aggs, iso, cost_param, eta) - cost_optimal[i])
-        cost, eta = dispatch_with_inital_state(iso, aggs, cost_param, eta, [1])
-        cost1.append(cost - cost_optimal[i])
-    eta = copy.deepcopy(eta_init)
-    for i in range(11):
-        p = i * 0.1
-        iso.p_set = p_set + p
-        cost, eta = dispatch_with_inital_state(iso, aggs, cost_param, eta, [3])
-        cost3.append(cost - cost_optimal[i])
-
-    # print(np.round(cost1, 8))
-    # print(np.round(cost3, 8))
-    # print(np.round(cost_optimal, 5))
-
-    cost_optimal = [0 for i in range(11)]
-
-    # 设置图形大小和线条颜色
-    fig, lines = plt.figure(), []
-    ax2 = fig.add_subplot(111)
-    p_sets = np.round([p_set + i * 0.1 for i in range(11)], decimals=2)
-
-    line, = ax2.plot(p_sets, cost1, label="Still use LA" + str(2), marker='d', color="#ff7f0e")
-    lines.append(line)
-    ax2.set_xlabel(r"$P_{AGC}$ (MW)")
-    ax2.set_ylabel(r"Expectation of cost (\$)   ")
-    ax2.set_xlim([p_set, p_set + 0.1])
-    delta_y = 1e-7
-    ax2.set_ylim([0, 14 * delta_y])
-    yticks_pos2 = [0, 2 * delta_y, 4 * delta_y, 6 * delta_y, 8 * delta_y, 10 * delta_y, 12 * delta_y, 14 * delta_y]
-    yticks_labels2 = [f'{int(tick)}' for tick in yticks_pos2]
-    ax2.set_yticks(yticks_pos2)
-    ax2.set_yticklabels(yticks_labels2)
-
-    ax1 = ax2.twinx()
-    # line, = ax1.plot(p_sets, cost1, label="Still use LA" + str(2), marker='d')
-    # lines.append(line)
-    line, = ax1.plot(p_sets, cost3, label="Still use LA" + str(4), marker='s', color="#d62728")
-    lines.append(line)
-
-    ax1.set_ylabel(r"Expectation of Cost1 (\$)")
-    y_bottom, y_top = 0, 7
-    delta_y = 1e-4
-    yticks_pos1 = [0, 1 * delta_y, 2 * delta_y, 3 * delta_y, 4 * delta_y, 5 * delta_y, 6 * delta_y, 7 * delta_y]
-    yticks_labels1 = [f"{np.round(tick, 6)}" for tick in yticks_pos1]
-    ax1.set_yticks(yticks_pos1)
-    ax1.set_yticklabels(yticks_labels1)
-    ax1.set_ylim([0, 7 * delta_y])
-
-    xticks_pos1 = [p_set + i * 0.1 for i in range(11)]
-    xticks_labels1 = [f"{np.round(tick, 9)}" for tick in xticks_pos1]
-    plt.xticks(xticks_pos1, xticks_labels1, rotation=0)
-
-    line, = ax2.plot(p_sets, cost_optimal, label="optimal solution", marker='o', color="#17becf")
-    lines.append(line)
-
-    # ax1.yaxis.set_major_formatter(ticker.ScalarFormatter(useMathText=True))
-    ax2.yaxis.set_major_formatter(ticker.ScalarFormatter(useMathText=True))
-    ax2.legend(handles=lines, loc='upper left')
-    ax2.grid(color='gray', linestyle='--', linewidth=0.5)
-
-    plt.savefig("./local_id_cost.svg", format="svg")
-    plt.show()
-
-    return 0
-
-
-def continue_use_id_marginal_value(p_set, aggs, cost_param):
-    iso = ISO(p_set, len(aggs))
-    p_sets = np.round([p_set + i * 0.1 for i in range(11)], decimals=2)
-    cost_init, eta_init = two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param)
-    # print("pset_init", iso.p_set, "cost_init", cost_init, "eta_init", eta_init)
-
-    # 计算强制调用某一agg的话，所有agg的Incremental rate的变化
-    prices = [[] for i in range(len(aggs))]
-    for i in range(11):
-        iso.p_set = p_set + i * 0.1
-        _, eta = two_stage_dynamic_dispatch_algorithm_one_time_test(iso, aggs, cost_param)
-        for j in range(len(aggs)):
-            prices[j].append(value_estimate_function(iso, aggs, cost_param, eta, j))
-
-    # 设置图形大小和线条颜色
-    fig, lines = plt.figure(), []
-    ax1 = fig.add_subplot(111)
-
-    # line, = ax1.plot(p_sets, prices[0], label="LA" + str(1), marker='d')
-    # lines.append(line)
-    line, = ax1.plot(p_sets, prices[1], label="LA" + str(2), marker='d', color="#ff7f0e")
-    lines.append(line)
-    line, = ax1.plot(p_sets, prices[2], label="LA" + str(3), marker='s', color="#2ca02c")
-    lines.append(line)
-    # line, = ax1.plot(p_sets, prices[3], label="LA" + str(4), marker='d')
-    # lines.append(line)
-    # line, = ax1.plot(p_sets, prices[4], label="LA" + str(5), marker='d')
-    # lines.append(line)
-
-    # ax1.set_title("Incremental rate of aggregators.")
-    ax1.set_xlabel(r"$P_{AGC}$ (MW)")
-    ax1.set_ylabel(r"Incremental rate (\$)")
-
-    # y_bottom, y_top = -1, 9
-    # yticks_pos1 = [i * 0.001 for i in range(y_bottom, y_top, 1)]
-    # yticks_pos1.append(y_top)
-    # yticks_labels1 = [f"{np.round(tick, 3)}" for tick in yticks_pos1]
-    # ax1.set_yticks(yticks_pos1)
-    # ax1.set_yticklabels(yticks_labels1)
-    ax1.set_ylim([0.326, 0.33195])
-
-    ax1.set_xlim([p_set, p_set + 0.1])
-    xticks_pos1 = [p_set + i * 0.1 for i in range(11)]
-    xticks_labels1 = [f"{np.round(tick, 2)}" for tick in xticks_pos1]
-    plt.xticks(xticks_pos1, xticks_labels1, rotation=0)
-
-    ax1.legend(handles=lines, loc='lower left')
-    ax1.grid(color='gray', linestyle='--', linewidth=0.5)
-
-    plt.savefig("./local_marginal_value_optimal.svg", format="svg")
-    plt.show()
-    iso.p_set = p_set
-
-    # 计算强制调用某一agg的话，所有agg的Incremental rate的变化
-    prices1 = [[] for i in range(len(aggs))]
-    eta = copy.deepcopy(eta_init)
-    for i in range(11):
-        eta[1] = eta_init[1] + (i * 0.1) / aggs[1].capacity
-        for j in range(len(aggs)):
-            prices1[j].append(value_estimate_function(iso, aggs, cost_param, eta, j))
-    # 设置图形大小和线条颜色
-    fig, lines = plt.figure(), []
-    ax1 = fig.add_subplot(111)
-
-    # line, = ax1.plot(p_sets, prices[0], label="LA" + str(1), marker='d')
-    # lines.append(line)
-    line, = ax1.plot(p_sets, prices1[1], label="LA" + str(2), marker='d', color="#ff7f0e")
-    lines.append(line)
-    line, = ax1.plot(p_sets, prices1[2], label="LA" + str(3), marker='s', color="#2ca02c")
-    lines.append(line)
-    # line, = ax1.plot(p_sets, prices[3], label="LA" + str(4), marker='d')
-    # lines.append(line)
-    # line, = ax1.plot(p_sets, prices[4], label="LA" + str(5), marker='d')
-    # lines.append(line)
-
-    # ax1.set_title("Incremental rate of aggregators.")
-    ax1.set_xlabel(r"$P_{AGC}$ (MW)")
-    ax1.set_ylabel(r"Incremental rate (\$)")
-
-    # y_bottom, y_top = -1, 9
-    # yticks_pos1 = [i * 0.001 for i in range(y_bottom, y_top, 1)]
-    # yticks_pos1.append(y_top)
-    # yticks_labels1 = [f"{np.round(tick, 3)}" for tick in yticks_pos1]
-    # ax1.set_yticks(yticks_pos1)
-    # ax1.set_yticklabels(yticks_labels1)
-    ax1.set_ylim([0.326, 0.33195])
-
-    ax1.set_xlim([p_set, p_set + 0.1])
-    xticks_pos1 = [p_set + i * 0.1 for i in range(11)]
-    xticks_labels1 = [f"{np.round(tick, 2)}" for tick in xticks_pos1]
-    plt.xticks(xticks_pos1, xticks_labels1, rotation=0)
-
-    ax1.legend(handles=lines, loc='lower left')
-    ax1.grid(color='gray', linestyle='--', linewidth=0.5)
-
-    plt.savefig("./local_marginal_value_still_use_LA2.svg", format="svg")
-    plt.show()
-
-    # 计算强制调用某一agg的话，所有agg的Incremental rate的变化
-    prices2 = [[] for i in range(len(aggs))]
-    eta = copy.deepcopy(eta_init)
-    for i in range(11):
-        eta[2] = eta_init[2] + (i * 0.1) / aggs[2].capacity
-        for j in range(len(aggs)):
-            prices2[j].append(value_estimate_function(iso, aggs, cost_param, eta, j))
-    # 设置图形大小和线条颜色
-    fig, lines = plt.figure(), []
-    ax1 = fig.add_subplot(111)
-
-    # line, = ax1.plot(p_sets, prices[0], label="LA" + str(1), marker='d')
-    # lines.append(line)
-    line, = ax1.plot(p_sets, prices2[1], label="LA" + str(2), marker='d', color="#ff7f0e")
-    lines.append(line)
-    line, = ax1.plot(p_sets, prices2[2], label="LA" + str(3), marker='s', color="#2ca02c")
-    lines.append(line)
-    # line, = ax1.plot(p_sets, prices[3], label="LA" + str(4), marker='d')
-    # lines.append(line)
-    # line, = ax1.plot(p_sets, prices[4], label="LA" + str(5), marker='d')
-    # lines.append(line)
-
-    # ax1.set_title("Incremental rate of aggregators.")
-    ax1.set_xlabel(r"$P_{AGC}$ (MW)")
-    ax1.set_ylabel(r"Incremental rate (\$)")
-
-    # y_bottom, y_top = -1, 9
-    # yticks_pos1 = [i * 0.001 for i in range(y_bottom, y_top, 1)]
-    # yticks_pos1.append(y_top)
-    # yticks_labels1 = [f"{np.round(tick, 3)}" for tick in yticks_pos1]
-    # ax1.set_yticks(yticks_pos1)
-    # ax1.set_yticklabels(yticks_labels1)
-    ax1.set_ylim([0.326, 0.33195])
-
-    ax1.set_xlim([p_set, p_set + 0.1])
-    xticks_pos1 = [p_set + i * 0.1 for i in range(11)]
-    xticks_labels1 = [f"{np.round(tick, 2)}" for tick in xticks_pos1]
-    plt.xticks(xticks_pos1, xticks_labels1, rotation=0)
-
-    ax1.legend(handles=lines, loc='lower left')
-    ax1.grid(color='gray', linestyle='--', linewidth=0.5)
-
-    plt.savefig("./local_marginal_value_still_use_LA3.svg", format="svg")
-    plt.show()
 
 
 # 绘制critical points
@@ -1882,85 +1712,136 @@ def draw_critical_points(iso, aggs, positions):
     positions[-1][0] = 99999999999
 
 
-def frequency_regulation_simulator1():
-    eng = matlab.engine.start_matlab()  # 启动
-    eng.addpath(r'E:\wjc_code\matlab\aggregator', nargout=0)  # 确保 MATLAB 能找到函数文件所在路径
+def compare_time(cost_param, mpc, my_sample_times, method="gurobi"):
+    print("optimizer:", method)
+    gurobi_times = []
+    two_stage_times = []
+    stage1_times, stage2_times = [], []
 
-    # 仿真参数
-    time_delay_gurobi = 1.0
-    time_delay_TEIRP_PDA = 0.05
-    total_FR_steps = 150  # 负荷波动次数
+    for i in range(1, 10):
+        # init aggs with specific number
+        print("Number of AGGs:", int(i * 1000))
+        aggs = generate_mass_aggs(int(i * 1000))
+        # set agg locations on 4 nodes
+        nid2aid_info = [random.randint(0, 3) for _ in range(i * 10)]
+        nid2aid = {3: [], 21: [], 17: [], 28: []}
+        for j in range(len(nid2aid_info)):
+            if nid2aid_info[j] == 0:
+                nid2aid[3].append(j)
+            elif nid2aid_info[j] == 1:
+                nid2aid[21].append(j)
+            elif nid2aid_info[j] == 2:
+                nid2aid[17].append(j)
+            elif nid2aid_info[j] == 3:
+                nid2aid[28].append(j)
+        define_mpc(mpc, aggs, nid2aid)
+        total_power = i * 10 * 10
+        iso = ISO(total_power, len(aggs))
+        start_time = time.time()
+        stage1_time, stage2_time = two_stage_dynamic_dispatch_algorithm_time(iso, aggs, cost_param, mpc,
+                                                                             sample_times=my_sample_times)
+        end_time = time.time()
+        two_stage_time = end_time - start_time
 
-    # 生成仿真输入序列
-    np.random.seed(0)
-    power_gap = matlab.double(np.random.uniform(-300, 300, total_FR_steps).tolist())
-    # print(power_gap)
+        gurobi_time = test_gurobi_time(iso, aggs, cost_param, mpc, sample_times=my_sample_times, method=method)
+        gurobi_times.append(gurobi_time)
+        two_stage_times.append(two_stage_time)
+        stage1_times.append(stage1_time)
+        stage2_times.append(stage2_time)
+        print(i, stage1_time, stage2_time, gurobi_time, "s")
+    print(stage1_times, stage2_times, gurobi_times)
 
-    frequency_gurobi, time_out_gurobi = eng.simulate_secondary_frequency(power_gap, time_delay_gurobi,
-                                                                         nargout=2)  # 调用 MATLAB 函数
-    frequency_TEIRP_PDA, time_out_TEIRP_PDA = eng.simulate_secondary_frequency(power_gap, time_delay_TEIRP_PDA, nargout=2)  # 调用 MATLAB 函数
+    a, b, c = gurobi_times, stage1_times, stage2_times
+    # 设置 x 轴标签
+    labels = [f'{(i + 1) * 10}' for i in range(len(a))]
 
-    frequency_gurobi = np.array(frequency_gurobi).transpose().tolist()[0]
-    frequency_TEIRP_PDA = np.array(frequency_TEIRP_PDA).transpose().tolist()[0]
-    # print(frequency_gurobi)
-    print(len(time_out_TEIRP_PDA))
-    fd_gurobi, fd_TEIRP_PDA = 0, 0
-    for i in range(len(frequency_gurobi)):
-        fd_gurobi += abs(frequency_gurobi[i])
-        fd_TEIRP_PDA += abs(frequency_TEIRP_PDA[i])
-    fd_gurobi /= len(frequency_gurobi)
-    fd_TEIRP_PDA /= len(frequency_TEIRP_PDA)
-    print("Frequency divation (gurobi, TEIRP_PDA, difference):", fd_gurobi, fd_TEIRP_PDA, fd_gurobi - fd_TEIRP_PDA)
-    print("gurobi", max(frequency_gurobi), min(frequency_gurobi))
-    print("TEIRP_PDA", max(frequency_TEIRP_PDA), min(frequency_TEIRP_PDA))
+    x = np.arange(len(labels))  # the label locations
+    width = 0.35  # the width of the bars
 
-    for i in range(len(frequency_gurobi)):
-        frequency_gurobi[i] += 50
-        frequency_TEIRP_PDA[i] += 50
-    plt.plot(frequency_gurobi, label="Interior point method")
-    plt.plot(frequency_TEIRP_PDA, label="TEIRP-PDA")
-    plt.xlim(0, 90001)
-    plt.ylim(49.90, 50.10)
-    # 自定义横坐标刻度和标签
-    ticks = [0, 10000, 20000, 30000, 40000, 50000, 60000, 70000, 80000, 90000]  # 横坐标刻度
-    labels = ['0', '100', '200', '300', '400', '500', '600', '700', '800', '900']  # 横坐标标签
-    plt.xticks(ticks, labels)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Frequency (Hz)')
+    plt.figure()
+
+    # 绘制 a 的柱子
+    plt.bar(x - width / 2, a, label='Interior point method', width=0.3)
+
+    # 绘制 b 和 c 组合的柱子
+    bottom_c = [0] * len(c)
+    for i in range(len(c)):
+        if i == 0:
+            plt.bar(x[i] + width / 2, c[i], bottom=bottom_c[i], label='TEIRP-PDA', color='red',
+                    width=0.3)
+            bottom_c[i] += c[i]
+        else:
+            plt.bar(x[i] + width / 2, c[i], bottom=bottom_c[i], color='red', width=0.3)
+            bottom_c[i] += c[i]
+    # for i in range(len(b)):
+    #     if i == 0:
+    #         plt.bar(x[i] + width / 2, b[i], bottom=bottom_c[i], label='Stage 1', color='green', width=0.3)
+    #     else:
+    #         plt.bar(x[i] + width / 2, b[i], bottom=bottom_c[i], color='green', width=0.3)
+
+    # 设置 x 轴标签和标题
+    plt.xticks(range(len(a)), labels)
+    plt.xlabel('Number of Load Aggregators')
+    plt.ylabel('Execution Time of Determining A Real-time Power Distribution (s)')
+
+    # 添加图例
     plt.legend()
-    # plt.legend(handles=lines, loc='upper left', bbox_to_anchor=(1.1, 1), borderaxespad=0.)
-    plt.grid(color='gray', linestyle='--', linewidth=0.5)
 
-    plt.savefig("./primary_frequency.svg", format="svg")
+    # 显示图形
+    plt.savefig("./time.svg", format="svg")
     plt.show()
-
-    eng.quit()
-
-
-# 验证目标函数的Hessian矩阵是否为正定矩阵(对\eta_{si}、\eta_{sj}求偏导)
-def verify_zhengding_matrix1(aggs):
-    matrix = np.zeros([len(aggs), len(aggs)])
-    for i in range(len(aggs)):
-        for j in range(len(aggs)):
-            if i != j:
-                matrix[i][j] = aggs[i].capacity * aggs[j].capacity * (E(aggs[i]) * E(aggs[j]))
-            else:
-                matrix[i][j] = aggs[i].capacity * aggs[j].capacity * (E(aggs[i]) * E(aggs[j]) + Var(aggs[i]))
-    eigenvalues = np.linalg.eigvals(matrix)
-    print("eigenvalues", eigenvalues)
+    return 0
 
 
-# 验证目标函数的Hessian矩阵是否为正定矩阵(对c_i\eta_{si}、c_j\eta_{sj}求偏导)
-def verify_zhengding_matrix2(aggs):
-    matrix = np.zeros([len(aggs), len(aggs)])
-    for i in range(len(aggs)):
-        for j in range(len(aggs)):
-            if i != j:
-                matrix[i][j] = E(aggs[i]) * E(aggs[j])
-            else:
-                matrix[i][j] = E(aggs[i]) * E(aggs[j]) + Var(aggs[i])
-    eigenvalues = np.linalg.eigvals(matrix)
-    print("eigenvalues", eigenvalues)
+def draw_all_time():
+    gurobi_times = [1.052, 1.167, 1.296, 1.505, 1.662, 1.833, 2.058, 2.369, 2.677]
+    cplex_times = [0.765, 0.913, 1.181, 1.404, 1.742, 2.206, 2.647, 3.073, 3.631]
+    stage2_times = [0.014, 0.021, 0.027, 0.034, 0.038, 0.045, 0.052, 0.060, 0.071]
+    a, b, c = gurobi_times, cplex_times, stage2_times,
+    # 设置 x 轴标签
+    labels = [f'{(i + 1) * 10}' for i in range(len(a))]
+
+    x = np.arange(len(labels))  # the label locations
+    width = 0.36  # the width of the bars
+
+    plt.figure()
+
+    # 绘制 a 的柱子
+    plt.bar(x - width / 3, a, label='IPM(Gurobi)', width=width / 3)
+
+    bottom_b = [0] * len(b)
+    for i in range(len(b)):
+        if i == 0:
+            plt.bar(x[i], b[i], bottom=bottom_b[i], label='IPM(Cplex)', color='green',
+                    width=width / 3)
+            bottom_b[i] += c[i]
+        else:
+            plt.bar(x[i], b[i], bottom=bottom_b[i], color='green', width=width / 3)
+            bottom_b[i] += b[i]
+
+    # 绘制 b 和 c 组合的柱子
+    bottom_c = [0] * len(c)
+    for i in range(len(c)):
+        if i == 0:
+            plt.bar(x[i] + width / 3, c[i], bottom=bottom_c[i], label='TEIRP-PDA', color='red',
+                    width=width / 3)
+            bottom_c[i] += c[i]
+        else:
+            plt.bar(x[i] + width / 3, c[i], bottom=bottom_c[i], color='red', width=width / 3)
+            bottom_c[i] += c[i]
+
+    # 设置 x 轴标签和标题
+    plt.xticks(range(len(a)), labels)
+    plt.xlabel('Number of Load Aggregators')
+    plt.ylabel('Execution Time of Determining A Real-time Power Distribution (s)')
+
+    # 添加图例
+    plt.legend()
+
+    # 显示图形
+    plt.savefig("./time.svg", format="svg")
+    plt.savefig("./time.pdf", format="pdf")
+    plt.show()
 
 
 def two_aggregator():
@@ -1974,22 +1855,27 @@ def two_aggregator():
                           ],
                          1200)
     iso = ISO(total_power, len(aggs))
+    mpc = case33()
+    define_mpc(mpc, aggs)
 
-    # draw power assignment results calculated by Gurobi
-    draw_assignment(aggs, total_power, iso, cost_param, sample_time=600)
+    # # Case 1
+    # draw_MonteCarlo_assignment(aggs, total_power, iso, cost_param, mpc)
+    # # draw power assignment results calculated by Gurobi
+    # draw_assignment(aggs, total_power, iso, cost_param, mpc, sample_time=600)
+    # draw_value_estimate_function(aggs, total_power, iso, cost_param, mpc, 600, "gurobi")
 
     # draw power assignment results calculated by TEIRP-PDA
-    draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, sample_times=600)
-    # draw turning points of stage 1 in TEIRP-PDA
-    positions = get_inflection_positions(iso, aggs, cost_param)
-    draw_critical_points(iso, aggs, positions)
+    # draw_two_stage_dynamic_dispatch_algorithm(iso, aggs, cost_param, mpc, sample_times=600)
+    # draw_value_estimate_function(aggs, total_power, iso, cost_param, mpc, 600, "TEIRP")
 
-    # Compare the calculation speed for coordinate mass aggregators by Gurobi or TEIRP-PDA
-    my_sample_times = 150
-    draw_time(cost_param, my_sample_times)
+    # # draw turning points of stage 1 in TEIRP-PDA
+    # positions = get_inflection_positions(iso, aggs, cost_param, mpc)
+    # draw_critical_points(iso, aggs, positions)
 
-    # Simulate the frequency
-    frequency_regulation_simulator1()
+    # # Case 2
+    # # Compare the calculation speed for coordinate mass aggregators by Gurobi or TEIRP-PDA
+    my_sample_times = 2 * 150
+    # draw_all_time()
 
 
 if __name__ == "__main__":
@@ -2007,5 +1893,9 @@ if __name__ == "__main__":
     over_response_ratio_up = 0.15
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',  # 使用颜色编码定义颜色
               '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+
+    # 常数参数设置
+    V_root_sqr = 1.0  # root node的电压为固定的1.0pu,断点处电压>0.95pu  基准电压10kV  基准功率1kW
+    V_max_sqr, V_min_sqr = 1.21, 0.81  # 各节点电压范围为1.05pu--0.95pu
 
     two_aggregator()
