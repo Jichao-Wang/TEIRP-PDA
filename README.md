@@ -25,7 +25,4 @@ Some python packages:
 </ul>
 
 ## Quick start
-
-**Note**: If you want simulate the frequency, please launch Matlab before run python files.
-
 `python TEIRP_PDA.py`
